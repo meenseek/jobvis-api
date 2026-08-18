@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:18.4-alpine
+    environment:
+      POSTGRES_DB: jobvis
+      POSTGRES_USER: jobvis
+      POSTGRES_PASSWORD: jobvis-local
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - jobvis-postgres:/var/lib/postgresql/18/docker
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobvis -d jobvis"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  jobvis-postgres:
