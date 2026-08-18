@@ -1,0 +1,13 @@
+.git
+.gradle
+.kotlin
+.idea
+.vscode
+build
+*.iml
+.env*
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
