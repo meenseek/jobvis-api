@@ -1,7 +1,10 @@
 package com.meenseek.jobvis
 
 import com.meenseek.jobvis.connection.ConnectionProvider
+import com.meenseek.jobvis.connection.ExternalConnectionRepository
+import com.meenseek.jobvis.connection.ExternalConnection
 import com.meenseek.jobvis.connection.NaverCredentialValidator
+import com.meenseek.jobvis.imports.ImportRunRepository
 import com.meenseek.jobvis.imports.ImportRunWorker
 import com.meenseek.jobvis.imports.MailCandidate
 import com.meenseek.jobvis.imports.MailCollector
@@ -10,6 +13,7 @@ import com.meenseek.jobvis.imports.MonitoringImportScheduler
 import com.meenseek.jobvis.imports.ImportRunClaimService
 import com.meenseek.jobvis.imports.ImportRunCompletionService
 import com.meenseek.jobvis.imports.ImportRunService
+import com.meenseek.jobvis.imports.CreateImportRunRequest
 import com.meenseek.jobvis.imports.MailFailureDisposition
 import com.meenseek.jobvis.common.ServiceUnavailableException
 import org.assertj.core.api.Assertions.assertThat
@@ -33,7 +37,9 @@ import org.springframework.test.web.servlet.result.MockMvcResultMatchers.status
 import tools.jackson.databind.JsonNode
 import tools.jackson.databind.ObjectMapper
 import java.time.Clock
+import java.time.Duration
 import java.time.Instant
+import java.time.LocalDate
 import java.time.ZoneOffset
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -61,9 +67,144 @@ class ImportApiIntegrationTests @Autowired constructor(
 	private val monitoringScheduler: MonitoringImportScheduler,
 	private val claimService: ImportRunClaimService,
 	private val completionService: ImportRunCompletionService,
+	private val runRepository: ImportRunRepository,
+	private val connectionRepository: ExternalConnectionRepository,
 	private val runService: ImportRunService,
 	private val testMailCollector: TestMailCollector,
 ) : PostgresIntegrationTest() {
+	@Test
+	fun `scheduled dispatch는 외부 메일 수집 완료를 기다리지 않는다`() {
+		val userId = UUID.randomUUID()
+		val connectionId = connectNaver(userId)
+		val run = createRun(userId, connectionId)
+		val gate = testMailCollector.block(connectionId)
+		val dispatcher = Executors.newSingleThreadExecutor()
+		try {
+			val dispatched = dispatcher.submit<Boolean> { worker.dispatchOnce() }
+			assertThat(gate.started.await(10, TimeUnit.SECONDS)).isTrue()
+			assertThat(dispatched.get(1, TimeUnit.SECONDS)).isTrue()
+		} finally {
+			gate.release.countDown()
+			dispatcher.shutdownNow()
+		}
+		awaitRunStatus(UUID.fromString(run.path("id").asString()), "COMPLETED")
+	}
+
+	@Test
+	fun `같은 Gmail 계정의 동시 실행은 사용자와 인스턴스가 달라도 하나만 생성한다`() {
+		val firstUserId = UUID.randomUUID()
+		val secondUserId = UUID.randomUUID()
+		val firstConnectionId = connectGmail(firstUserId, "shared-account@example.com")
+		val secondConnectionId = connectGmail(secondUserId, "SHARED-ACCOUNT@example.com")
+		val start = CountDownLatch(1)
+		val executor = Executors.newFixedThreadPool(2)
+		try {
+			val futures = listOf(
+				firstUserId to firstConnectionId,
+				secondUserId to secondConnectionId,
+			).map { (userId, connectionId) ->
+				executor.submit(
+					java.util.concurrent.Callable {
+						start.await()
+						runCatching {
+							runService.create(
+								userId,
+								CreateImportRunRequest(
+									connectionId,
+									LocalDate.parse("2026-08-01"),
+									LocalDate.parse("2026-08-17"),
+								),
+							)
+						}
+					},
+				)
+			}
+			start.countDown()
+			val results = futures.map { it.get(10, TimeUnit.SECONDS) }
+
+			assertThat(results.count { it.isSuccess }).isEqualTo(1)
+			assertThat(results.count { it.isFailure }).isEqualTo(1)
+			assertThat(
+				jdbcTemplate.queryForObject(
+					"""
+						SELECT count(*) FROM import_runs
+						WHERE connection_id IN (?, ?) AND status IN ('QUEUED', 'RUNNING')
+					""".trimIndent(),
+					Long::class.java,
+					firstConnectionId,
+					secondConnectionId,
+				),
+			).isEqualTo(1)
+		} finally {
+			start.countDown()
+			executor.shutdownNow()
+			jdbcTemplate.update(
+				"""
+					UPDATE import_runs
+					SET status = 'CANCELLED', completed_at = ?, updated_at = ?
+					WHERE connection_id IN (?, ?) AND status IN ('QUEUED', 'RUNNING')
+				""".trimIndent(),
+				java.sql.Timestamp.from(NOW),
+				java.sql.Timestamp.from(NOW),
+				firstConnectionId,
+				secondConnectionId,
+			)
+		}
+	}
+
+	@Test
+	fun `interrupt를 무시하는 실행은 종료 중 재큐잉하지 않고 lease 회수에 맡긴다`() {
+		val userId = UUID.randomUUID()
+		val connectionId = connectNaver(userId)
+		val runId = UUID.fromString(createRun(userId, connectionId).path("id").asString())
+		val started = CountDownLatch(1)
+		val release = CountDownLatch(1)
+		val finished = CountDownLatch(1)
+		val interrupted = AtomicInteger()
+		val interruptIgnoringCollector = MailCollector { connection, _, _ ->
+			started.countDown()
+			try {
+				var released = false
+				while (!released) {
+					try {
+						released = release.await(10, TimeUnit.SECONDS)
+					} catch (_: InterruptedException) {
+						interrupted.incrementAndGet()
+					}
+				}
+				MailCollectionResult(emptyList(), connection.version)
+			} finally {
+				finished.countDown()
+			}
+		}
+		val isolatedWorker = ImportRunWorker(
+			claimService, runRepository, connectionRepository, interruptIgnoringCollector, completionService,
+			1, Duration.ZERO, Duration.ofSeconds(1), 10,
+		)
+		try {
+			assertThat(isolatedWorker.dispatchOnce()).isTrue()
+			assertThat(started.await(10, TimeUnit.SECONDS)).isTrue()
+			isolatedWorker.shutdownExecutors()
+			assertThat(interrupted.get()).isGreaterThan(0)
+			awaitRunStatus(runId, "RUNNING")
+			release.countDown()
+			assertThat(finished.await(10, TimeUnit.SECONDS)).isTrue()
+			awaitRunStatus(runId, "RUNNING")
+		} finally {
+			release.countDown()
+			isolatedWorker.shutdownExecutors()
+			jdbcTemplate.update(
+				"""
+					UPDATE import_runs
+					SET status = 'CANCELLED', completed_at = ?, updated_at = ?,
+					    lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL
+					WHERE id = ? AND status = 'RUNNING'
+				""".trimIndent(),
+				java.sql.Timestamp.from(NOW), java.sql.Timestamp.from(NOW), runId,
+			)
+		}
+	}
+
 	@Test
 	fun `읽기 전용 가져오기는 초안을 만든 뒤 명시적 수락에서만 지원서와 일정 하나를 생성한다`() {
 		val userId = UUID.randomUUID()
@@ -317,7 +458,7 @@ class ImportApiIntegrationTests @Autowired constructor(
 		val userId = UUID.randomUUID()
 		val connectionId = connectNaver(userId, ongoingSyncConsent = true)
 		assertThat(monitoringScheduler.enqueueDue()).isEqualTo(1)
-		val claim = claimService.claimNext(NOW) ?: error("claim이 없습니다.")
+		val claim = claimService.claimNext() ?: error("claim이 없습니다.")
 		jdbcTemplate.update(
 			"UPDATE external_connections SET ongoing_sync_consent = false, next_sync_after = NULL WHERE id = ?",
 			connectionId,
@@ -354,7 +495,7 @@ class ImportApiIntegrationTests @Autowired constructor(
 		val userId = UUID.randomUUID()
 		val connectionId = connectNaver(userId)
 		createRun(userId, connectionId)
-		val claim = claimService.claimNext(NOW) ?: error("claim이 없습니다.")
+		val claim = claimService.claimNext() ?: error("claim이 없습니다.")
 		val collectedVersion = connectionVersion(connectionId)
 		jdbcTemplate.update("UPDATE external_connections SET version = version + 1 WHERE id = ?", connectionId)
 
@@ -408,12 +549,12 @@ class ImportApiIntegrationTests @Autowired constructor(
 		val userId = UUID.randomUUID()
 		val connectionId = connectNaver(userId)
 		val run = createRun(userId, connectionId)
-		val first = claimService.claimNext(NOW) ?: error("첫 claim이 없습니다.")
+		val first = claimService.claimNext() ?: error("첫 claim이 없습니다.")
 		jdbcTemplate.update(
 			"UPDATE import_runs SET lease_expires_at = ? WHERE id = ?",
 			java.sql.Timestamp.from(NOW.minusSeconds(1)), first.runId,
 		)
-		val second = claimService.claimNext(NOW) ?: error("재회수 claim이 없습니다.")
+		val second = claimService.claimNext() ?: error("재회수 claim이 없습니다.")
 		assertThat(second.runId.toString()).isEqualTo(run.path("id").asString())
 		assertThat(second.leaseOwner).isNotEqualTo(first.leaseOwner)
 
@@ -428,11 +569,32 @@ class ImportApiIntegrationTests @Autowired constructor(
 	}
 
 	@Test
+	fun `claim lease는 JVM clock이 아니라 DB clock에서 2분을 계산한다`() {
+		val userId = UUID.randomUUID()
+		val connectionId = connectNaver(userId)
+		createRun(userId, connectionId)
+		val claim = claimService.claimNext() ?: error("claim이 없습니다.")
+
+		val remainingSeconds = requireNotNull(
+			jdbcTemplate.queryForObject(
+				"""
+					SELECT EXTRACT(EPOCH FROM (lease_expires_at - clock_timestamp()))::double precision
+					FROM import_runs
+					WHERE id = ?
+				""".trimIndent(),
+				Double::class.java,
+				claim.runId,
+			),
+		)
+		assertThat(remainingSeconds).isBetween(110.0, 120.0)
+	}
+
+	@Test
 	fun `이미 claim된 실행은 늦은 취소 요청이 RUNNING 상태를 덮어쓰지 않는다`() {
 		val userId = UUID.randomUUID()
 		val connectionId = connectNaver(userId)
 		val run = createRun(userId, connectionId)
-		val claim = claimService.claimNext(NOW) ?: error("claim이 없습니다.")
+		val claim = claimService.claimNext() ?: error("claim이 없습니다.")
 		mockMvc.perform(
 			post("/api/v1/import-runs/{id}/cancel", run.path("id").asString()).header(USER_HEADER, userId),
 		).andExpect(status().isConflict)
@@ -446,7 +608,7 @@ class ImportApiIntegrationTests @Autowired constructor(
 		val userId = UUID.randomUUID()
 		val connectionId = connectNaver(userId, ongoingSyncConsent = true)
 		createRun(userId, connectionId)
-		val claim = claimService.claimNext(NOW) ?: error("claim이 없습니다.")
+		val claim = claimService.claimNext() ?: error("claim이 없습니다.")
 		completionService.fail(claim, "MAIL_PROVIDER_BUSY", MailFailureDisposition.TRANSIENT)
 
 		val connection = jdbcTemplate.queryForMap(
@@ -466,7 +628,7 @@ class ImportApiIntegrationTests @Autowired constructor(
 		val targetRunId = UUID.fromString(run.path("id").asString())
 		var targetClaim: com.meenseek.jobvis.imports.ClaimedImportRun? = null
 		repeat(20) {
-			val next = claimService.claimNext(NOW) ?: return@repeat
+			val next = claimService.claimNext() ?: return@repeat
 			if (next.runId == targetRunId) {
 				targetClaim = next
 				return@repeat
@@ -502,7 +664,7 @@ class ImportApiIntegrationTests @Autowired constructor(
 			"SELECT next_sync_after FROM external_connections WHERE id = ?", java.sql.Timestamp::class.java, connectionId,
 		)
 		createRun(userId, connectionId)
-		val claim = claimService.claimNext(NOW) ?: error("claim이 없습니다.")
+		val claim = claimService.claimNext() ?: error("claim이 없습니다.")
 		completionService.fail(claim, "IMPORT_LIMIT_EXCEEDED", MailFailureDisposition.RUN_ONLY)
 		val connection = jdbcTemplate.queryForMap(
 			"SELECT status, next_sync_after, last_error_code FROM external_connections WHERE id = ?",
@@ -528,7 +690,7 @@ class ImportApiIntegrationTests @Autowired constructor(
 		) ?: error("모니터 실행이 큐잉되지 않았습니다.")
 		var targetClaim: com.meenseek.jobvis.imports.ClaimedImportRun? = null
 		for (attempt in 0 until 50) {
-			val next = claimService.claimNext(NOW) ?: continue
+			val next = claimService.claimNext() ?: continue
 			if (next.runId == targetRunId) {
 				targetClaim = next
 				break
@@ -906,7 +1068,7 @@ class ImportApiIntegrationTests @Autowired constructor(
 		val userId = UUID.randomUUID()
 		val connectionId = connectNaver(userId, ongoingSyncConsent = true)
 		assertThat(monitoringScheduler.enqueueDue()).isEqualTo(1)
-		val claim = claimService.claimNext(NOW) ?: error("claim이 없습니다.")
+		val claim = claimService.claimNext() ?: error("claim이 없습니다.")
 		jdbcTemplate.update(
 			"UPDATE external_connections SET ongoing_sync_consent = false, next_sync_after = NULL WHERE id = ?",
 			connectionId,
@@ -1065,6 +1227,28 @@ class ImportApiIntegrationTests @Autowired constructor(
 		return UUID.fromString(json(response).path("id").asString())
 	}
 
+	private fun connectGmail(userId: UUID, accountEmail: String): UUID {
+		jdbcTemplate.update(
+			"INSERT INTO users (id, created_at, updated_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+			userId,
+			java.sql.Timestamp.from(NOW),
+			java.sql.Timestamp.from(NOW),
+		)
+		val connection = ExternalConnection.createOAuth(
+			UUID.randomUUID(),
+			userId,
+			ConnectionProvider.GMAIL,
+			accountEmail,
+			"encrypted-access-token",
+			"encrypted-refresh-token",
+			NOW.plusSeconds(3600),
+			setOf("https://www.googleapis.com/auth/gmail.readonly"),
+			false,
+			NOW,
+		)
+		return connectionRepository.saveAndFlush(connection).id
+	}
+
 	private fun createRun(userId: UUID, connectionId: UUID): JsonNode {
 		val response = mockMvc.perform(
 			post("/api/v1/import-runs")
@@ -1087,6 +1271,17 @@ class ImportApiIntegrationTests @Autowired constructor(
 			if (status in setOf("COMPLETED", "FAILED", "CANCELLED")) return
 		}
 		error("가져오기 실행이 완료되지 않았습니다: $runId")
+	}
+
+	private fun awaitRunStatus(runId: UUID, expectedStatus: String) {
+		repeat(100) {
+			val status = jdbcTemplate.queryForObject(
+				"SELECT status FROM import_runs WHERE id = ?", String::class.java, runId,
+			)
+			if (status == expectedStatus) return
+			Thread.sleep(20)
+		}
+		error("가져오기 실행이 $expectedStatus 상태가 되지 않았습니다: $runId")
 	}
 
 	private fun importRunBody(connectionId: UUID): String = objectMapper.writeValueAsString(
@@ -1160,6 +1355,7 @@ class ImportApiIntegrationTests @Autowired constructor(
 
 	class TestMailCollector : MailCollector {
 		private val calls = ConcurrentHashMap<UUID, AtomicInteger>()
+		private val blockingConnections = ConcurrentHashMap<UUID, CollectionGate>()
 		private val lowConfidenceConnections = ConcurrentHashMap.newKeySet<UUID>()
 		private val lowConfidenceOfferConnections = ConcurrentHashMap.newKeySet<UUID>()
 		private val oldActiveConnections = ConcurrentHashMap.newKeySet<UUID>()
@@ -1172,6 +1368,10 @@ class ImportApiIntegrationTests @Autowired constructor(
 			dateTo: java.time.LocalDate,
 		): com.meenseek.jobvis.imports.MailCollectionResult {
 			val call = calls.computeIfAbsent(connection.id) { AtomicInteger() }.incrementAndGet()
+			blockingConnections.remove(connection.id)?.let { gate ->
+				gate.started.countDown()
+				check(gate.release.await(10, TimeUnit.SECONDS))
+			}
 			if (serviceUnavailableConnections.remove(connection.id)) {
 				throw ServiceUnavailableException("temporary credential refresh outage")
 			}
@@ -1235,6 +1435,10 @@ class ImportApiIntegrationTests @Autowired constructor(
 
 		fun calls(connectionId: UUID): Int = calls[connectionId]?.get() ?: 0
 
+		fun block(connectionId: UUID): CollectionGate = CollectionGate().also { gate ->
+			blockingConnections[connectionId] = gate
+		}
+
 		fun reset(connectionId: UUID) {
 			calls.remove(connectionId)
 		}
@@ -1259,6 +1463,11 @@ class ImportApiIntegrationTests @Autowired constructor(
 			newEarlierScheduleConnections.add(connectionId)
 		}
 	}
+
+	class CollectionGate(
+		val started: CountDownLatch = CountDownLatch(1),
+		val release: CountDownLatch = CountDownLatch(1),
+	)
 
 	private companion object {
 		const val USER_HEADER = "X-Jobvis-User-Id"

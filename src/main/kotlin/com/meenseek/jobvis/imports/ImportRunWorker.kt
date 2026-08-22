@@ -19,8 +19,12 @@ import java.time.Duration
 import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.Semaphore
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 @Component
 class ImportRunWorker(
@@ -29,28 +33,90 @@ class ImportRunWorker(
 	private val connectionRepository: ExternalConnectionRepository,
 	private val mailCollector: MailCollector,
 	private val completionService: ImportRunCompletionService,
-	private val clock: Clock,
+	@Value("\${jobvis.import.worker-concurrency:2}") private val workerConcurrency: Int,
+	@Value("\${jobvis.import.worker-shutdown-grace:PT20S}") private val workerShutdownGrace: Duration,
+	@Value("\${jobvis.import.heartbeat-interval:PT20S}") private val heartbeatInterval: Duration,
+	@Value("\${spring.datasource.hikari.maximum-pool-size:10}") private val databasePoolSize: Int,
 ) {
-	private val heartbeatExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
-		Thread(runnable, "jobvis-import-heartbeat").apply { isDaemon = true }
+	private val workerThreadCounter = AtomicInteger()
+	private val heartbeatThreadCounter = AtomicInteger()
+	private val workerSlots: Semaphore
+	private val workerExecutor: java.util.concurrent.ExecutorService
+	private val heartbeatExecutor: java.util.concurrent.ScheduledExecutorService
+	private val acceptingWork = AtomicBoolean(true)
+	private val forceStopping = AtomicBoolean(false)
+
+	init {
+		require(workerConcurrency in 1..32) { "jobvis.import.worker-concurrency는 1~32여야 합니다." }
+		require(workerConcurrency <= databasePoolSize) {
+			"jobvis.import.worker-concurrency는 DB connection pool 크기 이하여야 합니다."
+		}
+		require(heartbeatInterval >= MIN_HEARTBEAT_INTERVAL &&
+			heartbeatInterval <= MAX_HEARTBEAT_INTERVAL
+		) {
+			"jobvis.import.heartbeat-interval은 1초 이상 30초 이하여야 합니다."
+		}
+		require(!workerShutdownGrace.isNegative && workerShutdownGrace <= MAX_WORKER_SHUTDOWN_GRACE) {
+			"jobvis.import.worker-shutdown-grace는 0초~5분이어야 합니다."
+		}
+		workerSlots = Semaphore(workerConcurrency)
+		workerExecutor = Executors.newFixedThreadPool(workerConcurrency) { runnable ->
+			Thread(runnable, "jobvis-import-worker-${workerThreadCounter.incrementAndGet()}").apply { isDaemon = true }
+		}
+		heartbeatExecutor = Executors.newScheduledThreadPool(workerConcurrency) { runnable ->
+			Thread(runnable, "jobvis-import-heartbeat-${heartbeatThreadCounter.incrementAndGet()}").apply {
+				isDaemon = true
+			}
+		}
 	}
 
 	@Scheduled(fixedDelayString = "\${jobvis.import.poll-delay:PT5S}")
 	fun poll() {
 		repeat(MAX_RUNS_PER_POLL) {
-			if (!runOnce()) return
+			if (!dispatchOnce()) return
+		}
+	}
+
+	internal fun dispatchOnce(): Boolean {
+		if (!acceptingWork.get()) return false
+		if (!workerSlots.tryAcquire()) return false
+		val claim = try {
+			claimService.claimNext()
+		} catch (exception: Exception) {
+			workerSlots.release()
+			throw exception
+		}
+		if (claim == null) {
+			workerSlots.release()
+			return false
+		}
+		return try {
+			workerExecutor.execute {
+				try {
+					processClaim(claim)
+				} finally {
+					workerSlots.release()
+				}
+			}
+			true
+		} catch (_: RejectedExecutionException) {
+			workerSlots.release()
+			claimService.releaseForRetry(claim)
+			false
 		}
 	}
 
 	fun runOnce(): Boolean {
-		val claim = claimService.claimNext(Instant.now(clock)) ?: return false
+		val claim = claimService.claimNext() ?: return false
 		processClaim(claim)
 		return true
 	}
 
 	internal fun processClaim(claim: ClaimedImportRun) {
+		if (forceStopping.get()) return
 		val run = runRepository.findById(claim.runId).orElse(null) ?: return
 		val connection = connectionRepository.findOwned(run.connectionId, run.userId)
+		if (forceStopping.get()) return
 		if (connection == null || connection.status != ConnectionStatus.CONNECTED) {
 			completionService.fail(
 				claim, "CONNECTION_NOT_CONNECTED", MailFailureDisposition.REAUTHORIZATION_REQUIRED,
@@ -70,6 +136,7 @@ class ImportRunWorker(
 		var attemptConnectionVersion = connection.version
 		try {
 			val latestConnection = connectionRepository.findOwned(run.connectionId, run.userId)
+			if (forceStopping.get()) return
 			if (run.requestedBy == ImportRequestedBy.MONITOR && latestConnection?.ongoingSyncConsent != true) {
 				completionService.cancel(claim, "MONITORING_CONSENT_REVOKED")
 				return
@@ -81,23 +148,28 @@ class ImportRunWorker(
 				return
 			}
 			val collection = mailCollector.collect(activeConnection, run.dateFrom, run.dateTo)
+			if (forceStopping.get()) return
 			completionService.complete(claim, collection)
 		} catch (exception: MailCollectionException) {
+			if (forceStopping.get()) return
 			completionService.fail(
 				claim, exception.errorCode, exception.disposition,
 				exception.connectionVersion ?: attemptConnectionVersion,
 			)
 		} catch (exception: ExternalConnectionAuthorizationException) {
+			if (forceStopping.get()) return
 			completionService.fail(
 				claim, "EXTERNAL_REAUTHORIZATION_REQUIRED", MailFailureDisposition.REAUTHORIZATION_REQUIRED,
 				exception.connectionVersion ?: attemptConnectionVersion,
 			)
 		} catch (_: ServiceUnavailableException) {
+			if (forceStopping.get()) return
 			completionService.fail(
 				claim, "IMPORT_SERVICE_TEMPORARILY_UNAVAILABLE", MailFailureDisposition.TRANSIENT,
 				attemptConnectionVersion,
 			)
 		} catch (_: Exception) {
+			if (forceStopping.get()) return
 			completionService.fail(
 				claim, "IMPORT_PROCESSING_FAILED", MailFailureDisposition.RUN_ONLY, attemptConnectionVersion,
 			)
@@ -106,21 +178,41 @@ class ImportRunWorker(
 		}
 	}
 
-	private fun startHeartbeat(claim: ClaimedImportRun): ScheduledFuture<*> = heartbeatExecutor.scheduleAtFixedRate(
-		{ runCatching { claimService.heartbeat(claim, Instant.now(clock)) } },
-		HEARTBEAT_INTERVAL_SECONDS,
-		HEARTBEAT_INTERVAL_SECONDS,
-		TimeUnit.SECONDS,
+	internal fun startHeartbeat(claim: ClaimedImportRun): ScheduledFuture<*> = heartbeatExecutor.scheduleAtFixedRate(
+		{ runCatching { claimService.heartbeat(claim) } },
+		heartbeatInterval.toNanos(),
+		heartbeatInterval.toNanos(),
+		TimeUnit.NANOSECONDS,
 	)
 
 	@PreDestroy
-	fun shutdownHeartbeatExecutor() {
+	fun shutdownExecutors() {
+		acceptingWork.set(false)
+		workerExecutor.shutdown()
+		val terminated = try {
+			workerExecutor.awaitTermination(workerShutdownGrace.toMillis(), TimeUnit.MILLISECONDS)
+		} catch (_: InterruptedException) {
+			Thread.currentThread().interrupt()
+			false
+		}
+		if (!terminated) {
+			forceStopping.set(true)
+			workerExecutor.shutdownNow()
+			try {
+				workerExecutor.awaitTermination(INTERRUPT_SETTLE_SECONDS, TimeUnit.SECONDS)
+			} catch (_: InterruptedException) {
+				Thread.currentThread().interrupt()
+			}
+		}
 		heartbeatExecutor.shutdownNow()
 	}
 
 	private companion object {
 		const val MAX_RUNS_PER_POLL = 5
-		const val HEARTBEAT_INTERVAL_SECONDS = 20L
+		const val INTERRUPT_SETTLE_SECONDS = 1L
+		val MIN_HEARTBEAT_INTERVAL: Duration = Duration.ofSeconds(1)
+		val MAX_HEARTBEAT_INTERVAL: Duration = Duration.ofSeconds(30)
+		val MAX_WORKER_SHUTDOWN_GRACE: Duration = Duration.ofMinutes(5)
 	}
 }
 
@@ -131,14 +223,15 @@ class ImportRunClaimService(
 	private val jdbcTemplate: JdbcTemplate,
 ) {
 	@Transactional(propagation = Propagation.REQUIRES_NEW)
-	fun claimNext(now: Instant): ClaimedImportRun? {
-		recoverExpired(now)
+	fun claimNext(): ClaimedImportRun? {
+		recoverExpired()
 		val leaseOwner = UUID.randomUUID()
 		return jdbcTemplate.query(
 		"""
 			UPDATE import_runs
-			SET status = 'RUNNING', started_at = ?, updated_at = ?,
-			    lease_owner = ?, lease_expires_at = ?, heartbeat_at = ?,
+			SET status = 'RUNNING', started_at = clock_timestamp(), updated_at = clock_timestamp(),
+			    lease_owner = ?, lease_expires_at = clock_timestamp() + interval '2 minutes',
+			    heartbeat_at = clock_timestamp(),
 			    attempt_count = attempt_count + 1
 			WHERE id = (
 			    SELECT id
@@ -156,48 +249,59 @@ class ImportRunClaimService(
 				resultSet.getObject("lease_owner", UUID::class.java),
 			)
 		},
-		Timestamp.from(now),
-		Timestamp.from(now),
 		leaseOwner,
-		Timestamp.from(now.plus(LEASE_DURATION)),
-		Timestamp.from(now),
 	).firstOrNull()
 	}
 
 	@Transactional(propagation = Propagation.REQUIRES_NEW)
-	fun heartbeat(claim: ClaimedImportRun, now: Instant): Boolean = jdbcTemplate.update(
+	open fun heartbeat(claim: ClaimedImportRun): Boolean = jdbcTemplate.update(
 		"""
 			UPDATE import_runs
-			SET heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+			SET heartbeat_at = clock_timestamp(),
+			    lease_expires_at = clock_timestamp() + interval '2 minutes',
+			    updated_at = clock_timestamp()
 			WHERE id = ? AND status = 'RUNNING' AND lease_owner = ?
 		""".trimIndent(),
-		Timestamp.from(now), Timestamp.from(now.plus(LEASE_DURATION)), Timestamp.from(now),
 		claim.runId, claim.leaseOwner,
 	) == 1
 
-	private fun recoverExpired(now: Instant) {
+	@Transactional(propagation = Propagation.REQUIRES_NEW)
+	fun releaseForRetry(claim: ClaimedImportRun): Boolean = jdbcTemplate.update(
+		"""
+			UPDATE import_runs
+			SET status = 'QUEUED', started_at = NULL, updated_at = clock_timestamp(),
+			    lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
+			    attempt_count = GREATEST(attempt_count - 1, 0)
+			WHERE id = ? AND status = 'RUNNING' AND lease_owner = ?
+		""".trimIndent(),
+		claim.runId, claim.leaseOwner,
+	) == 1
+
+	private fun recoverExpired() {
 		jdbcTemplate.update(
 			"""
 				UPDATE import_runs
-				SET status = 'FAILED', error_code = 'LEASE_EXPIRED', completed_at = ?, updated_at = ?,
+				SET status = 'FAILED', error_code = 'LEASE_EXPIRED',
+				    completed_at = clock_timestamp(), updated_at = clock_timestamp(),
 				    lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL
-				WHERE status = 'RUNNING' AND lease_expires_at <= ? AND attempt_count >= ?
+				WHERE status = 'RUNNING' AND lease_expires_at <= clock_timestamp()
+				  AND attempt_count >= ?
 			""".trimIndent(),
-			Timestamp.from(now), Timestamp.from(now), Timestamp.from(now), MAX_ATTEMPTS,
+			MAX_ATTEMPTS,
 		)
 		jdbcTemplate.update(
 			"""
 				UPDATE import_runs
-				SET status = 'QUEUED', started_at = NULL, updated_at = ?,
+				SET status = 'QUEUED', started_at = NULL, updated_at = clock_timestamp(),
 				    lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL
-				WHERE status = 'RUNNING' AND lease_expires_at <= ? AND attempt_count < ?
+				WHERE status = 'RUNNING' AND lease_expires_at <= clock_timestamp()
+				  AND attempt_count < ?
 			""".trimIndent(),
-			Timestamp.from(now), Timestamp.from(now), MAX_ATTEMPTS,
+			MAX_ATTEMPTS,
 		)
 	}
 
 	private companion object {
-		val LEASE_DURATION: Duration = Duration.ofMinutes(2)
 		const val MAX_ATTEMPTS = 3
 	}
 }
@@ -322,12 +426,26 @@ class ImportRetentionWorker(
 ) {
 	@Scheduled(fixedDelayString = "\${jobvis.import.cleanup-delay:PT1H}")
 	@Transactional
-	fun purgeExpired(): Int = jdbcTemplate.update(
-		"""
-			DELETE FROM import_runs
-			WHERE purge_after <= ?
-			  AND status IN ('COMPLETED', 'FAILED', 'CANCELLED')
-		""".trimIndent(),
-		Timestamp.from(Instant.now(clock)),
-	)
+	fun purgeExpired(): Int {
+		val now = Instant.now(clock)
+		val deletedRuns = jdbcTemplate.update(
+			"""
+				DELETE FROM import_runs
+				WHERE purge_after <= ?
+				  AND status IN ('COMPLETED', 'FAILED', 'CANCELLED')
+			""".trimIndent(),
+			Timestamp.from(now),
+		)
+		purgeExpiredGmailQuotaGates()
+		return deletedRuns
+	}
+
+	internal fun purgeExpiredGmailQuotaGates(): Int = jdbcTemplate.update(
+			"""
+				DELETE FROM gmail_quota_gates
+				WHERE updated_at <= clock_timestamp() - interval '7 days'
+				  AND next_permit_at <= clock_timestamp()
+				  AND blocked_until <= clock_timestamp()
+			""".trimIndent(),
+		)
 }

@@ -5,7 +5,9 @@ import com.meenseek.jobvis.common.ConflictException
 import com.meenseek.jobvis.common.NotFoundException
 import com.meenseek.jobvis.common.BusinessTime
 import com.meenseek.jobvis.connection.ConnectionCapability
+import com.meenseek.jobvis.connection.ConnectionProvider
 import com.meenseek.jobvis.connection.ConnectionStatus
+import com.meenseek.jobvis.connection.ExternalConnection
 import com.meenseek.jobvis.connection.ExternalConnectionRepository
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.dao.DataIntegrityViolationException
@@ -18,6 +20,7 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
+import java.util.Locale
 import java.util.UUID
 
 @Service
@@ -73,6 +76,7 @@ class ImportRunService(
 		if (connection.provider.capability != ConnectionCapability.MAIL ||
 			connection.status != ConnectionStatus.CONNECTED || !connection.ongoingSyncConsent
 		) return null
+		if (!reserveGmailAccountImport(connection)) return null
 		val id = UUID.randomUUID()
 		val now = Instant.now(clock)
 		val inserted = jdbcTemplate.update(
@@ -110,6 +114,9 @@ class ImportRunService(
 		if (connection.status != ConnectionStatus.CONNECTED) {
 			throw ConflictException("외부 메일 연결을 다시 승인한 뒤 가져오기를 시작해 주세요.")
 		}
+		if (!reserveGmailAccountImport(connection)) {
+			throw ConflictException("이 Gmail 계정에서 이미 가져오기가 진행 중입니다.")
+		}
 		if (runRepository.existsActive(userId, connectionId)) {
 			throw ConflictException("이 메일 연결에서 이미 가져오기가 진행 중입니다.")
 		}
@@ -123,6 +130,30 @@ class ImportRunService(
 		} catch (_: DataIntegrityViolationException) {
 			throw ConflictException("이 메일 연결에서 이미 가져오기가 진행 중입니다.")
 		}
+	}
+
+	private fun reserveGmailAccountImport(connection: ExternalConnection): Boolean {
+		if (connection.provider != ConnectionProvider.GMAIL) return true
+		val accountKey = connection.accountEmail.trim().lowercase(Locale.ROOT)
+		jdbcTemplate.queryForList(
+			"SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+			"jobvis:gmail-import:$accountKey",
+		)
+		val active = jdbcTemplate.queryForObject(
+			"""
+				SELECT EXISTS (
+				    SELECT 1
+				    FROM import_runs run
+				    JOIN external_connections connection ON connection.id = run.connection_id
+				    WHERE run.status IN ('QUEUED', 'RUNNING')
+				      AND connection.provider = 'GMAIL'
+				      AND lower(btrim(connection.account_email)) = ?
+				)
+			""".trimIndent(),
+			Boolean::class.java,
+			accountKey,
+		) == true
+		return !active
 	}
 
 	private fun findOwned(userId: UUID, runId: UUID): ImportRun =

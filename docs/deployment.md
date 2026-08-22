@@ -43,7 +43,9 @@ docker build -t jobvis-api:0.0.1 .
 
 암호화 키는 예를 들어 `openssl rand -base64 32`로 만들 수 있습니다. 키를 잃으면 저장된 외부 토큰과 네이버 앱 비밀번호를 복구할 수 없습니다. 키 교체 기능은 아직 없으므로 키를 버전 관리에 넣지 말고 별도 백업해야 합니다.
 
-선택 조정값은 `JOBVIS_IMPORT_MAX_MESSAGES`, `JOBVIS_IMPORT_RETENTION`, `JOBVIS_IMPORT_POLL_DELAY`, `JOBVIS_IMPORT_MONITOR_DELAY`, `JOBVIS_IMPORT_CLEANUP_DELAY`, `JOBVIS_AUTH_CLEANUP_DELAY`, `JOBVIS_SESSION_TTL`, `JOBVIS_LOGIN_CHALLENGE_TTL`, `JOBVIS_LOGIN_RATE_LIMIT_WINDOW`, `JOBVIS_LOGIN_RATE_LIMIT_PER_IP`, `JOBVIS_LOGIN_RATE_LIMIT_MAX_CLIENTS`, `JOBVIS_LOGIN_MAX_OUTSTANDING_CHALLENGES`, `JOBVIS_OAUTH_MAX_OUTSTANDING_PER_USER`, `JOBVIS_OAUTH_START_RATE_WINDOW`, `JOBVIS_OAUTH_START_RATE_PER_USER`, `JOBVIS_OAUTH_EXCHANGE_LEASE`, `JOBVIS_OAUTH_REFRESH_LEASE`, `JOBVIS_NAVER_VALIDATION_WINDOW`, `JOBVIS_NAVER_VALIDATION_ATTEMPTS`, `JOBVIS_NAVER_VALIDATION_MAX_CLIENTS`, `JOBVIS_NAVER_VALIDATION_MAX_CONCURRENT`, `JOBVIS_EXTERNAL_CONNECT_TIMEOUT`, `JOBVIS_EXTERNAL_READ_TIMEOUT`, `JOBVIS_DB_MAX_POOL_SIZE`입니다. OAuth lease는 외부 HTTP timeout보다 충분히 길어야 하며 애플리케이션이 시작 시 이 관계를 검증합니다. Calendar 확인 claim은 토큰 갱신과 일정 등록에 적용되는 외부 HTTP timeout 합계에서 자동 계산됩니다.
+선택 조정값은 `JOBVIS_IMPORT_MAX_MESSAGES`, `JOBVIS_GMAIL_FETCH_CONCURRENCY`, `JOBVIS_IMPORT_WORKER_CONCURRENCY`, `JOBVIS_IMPORT_WORKER_SHUTDOWN_GRACE`, `JOBVIS_IMPORT_HEARTBEAT_INTERVAL`, `JOBVIS_IMPORT_RETENTION`, `JOBVIS_IMPORT_POLL_DELAY`, `JOBVIS_IMPORT_MONITOR_DELAY`, `JOBVIS_IMPORT_CLEANUP_DELAY`, `JOBVIS_AUTH_CLEANUP_DELAY`, `JOBVIS_SESSION_TTL`, `JOBVIS_LOGIN_CHALLENGE_TTL`, `JOBVIS_LOGIN_RATE_LIMIT_WINDOW`, `JOBVIS_LOGIN_RATE_LIMIT_PER_IP`, `JOBVIS_LOGIN_RATE_LIMIT_MAX_CLIENTS`, `JOBVIS_LOGIN_MAX_OUTSTANDING_CHALLENGES`, `JOBVIS_OAUTH_MAX_OUTSTANDING_PER_USER`, `JOBVIS_OAUTH_START_RATE_WINDOW`, `JOBVIS_OAUTH_START_RATE_PER_USER`, `JOBVIS_OAUTH_EXCHANGE_LEASE`, `JOBVIS_OAUTH_REFRESH_LEASE`, `JOBVIS_NAVER_VALIDATION_WINDOW`, `JOBVIS_NAVER_VALIDATION_ATTEMPTS`, `JOBVIS_NAVER_VALIDATION_MAX_CLIENTS`, `JOBVIS_NAVER_VALIDATION_MAX_CONCURRENT`, `JOBVIS_EXTERNAL_CONNECT_TIMEOUT`, `JOBVIS_EXTERNAL_READ_TIMEOUT`, `JOBVIS_DB_MAX_POOL_SIZE`입니다. OAuth lease는 외부 HTTP timeout보다 충분히 길어야 하며 애플리케이션이 시작 시 이 관계를 검증합니다. Calendar 확인 claim은 토큰 갱신과 일정 등록에 적용되는 외부 HTTP timeout 합계에서 자동 계산됩니다.
+
+각 import claim의 heartbeat가 서로를 막지 않도록 `JOBVIS_IMPORT_WORKER_CONCURRENCY`는 1~32이면서 `JOBVIS_DB_MAX_POOL_SIZE` 이하여야 합니다. `JOBVIS_GMAIL_FETCH_CONCURRENCY`는 1~16, `JOBVIS_IMPORT_HEARTBEAT_INTERVAL`은 1~30초, `JOBVIS_IMPORT_WORKER_SHUTDOWN_GRACE`는 0초~5분이어야 합니다. heartbeat는 worker 수만큼 병렬 실행되며 애플리케이션이 시작 시 이 범위를 모두 검증합니다.
 
 전달 헤더는 기본적으로 신뢰하지 않습니다. 인그레스가 클라이언트의 `Forwarded`/`X-Forwarded-*` 값을 제거하고 직접 다시 쓰는 구성이 확인된 경우에만 `JOBVIS_FORWARD_HEADERS_STRATEGY=framework`를 사용합니다.
 
@@ -53,7 +55,7 @@ docker build -t jobvis-api:0.0.1 .
 - readiness: `GET /actuator/health/readiness`
 - 전체 상태: `GET /actuator/health`
 
-플랫폼 종료 신호에는 Spring의 graceful shutdown을 사용합니다. readiness가 성공한 뒤 트래픽을 보내고, 배포 시 최소 30초의 종료 유예 시간을 둡니다.
+플랫폼 종료 신호에는 Spring의 graceful shutdown을 사용합니다. readiness가 성공한 뒤 트래픽을 보냅니다. 플랫폼 종료 유예 시간은 Spring 종료 단계 30초, `JOBVIS_IMPORT_WORKER_SHUTDOWN_GRACE`, Gmail executor 정리 5초와 여유 시간을 모두 합한 값보다 길어야 합니다. 기본 설정에서는 최소 60초를 두고, worker 종료 유예를 늘리면 플랫폼 유예도 같은 만큼 늘립니다. 유예가 끝난 import는 실패로 기록하거나 즉시 재큐잉하지 않고 기존 lease 만료 후 다른 인스턴스가 회수합니다.
 
 ## 외부 서비스 권한
 
