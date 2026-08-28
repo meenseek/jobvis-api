@@ -12,7 +12,7 @@ FROM eclipse-temurin:17-jre-jammy
 
 RUN groupadd --system jobvis && useradd --system --gid jobvis --home-dir /app jobvis
 WORKDIR /app
-COPY --from=build --chown=jobvis:jobvis /workspace/build/libs/jobvis-api-0.0.1-SNAPSHOT.jar /app/jobvis-api.jar
+COPY --from=build --chown=jobvis:jobvis /workspace/build/libs/jobvis-api.jar /app/jobvis-api.jar
 
 USER jobvis
 EXPOSE 8080

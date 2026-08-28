@@ -15,7 +15,7 @@ Jobvis API는 특정 클라우드 SDK에 의존하지 않는 OCI 컨테이너와
 ## 이미지
 
 ```bash
-docker build -t jobvis-api:0.0.1 .
+docker build -t jobvis-api:local .
 ```
 
 이미지는 root가 아닌 `jobvis` 사용자로 실행됩니다. 로컬에서 이미지만 점검할 때도 데이터베이스 URL과 암호화 키가 필요합니다.

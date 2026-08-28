@@ -7,7 +7,6 @@ plugins {
 }
 
 group = "com.meenseek.jobvis"
-version = "0.0.1-SNAPSHOT"
 description = "Jobvis API"
 
 java {
@@ -54,6 +53,10 @@ allOpen {
 	annotation("jakarta.persistence.Entity")
 	annotation("jakarta.persistence.MappedSuperclass")
 	annotation("jakarta.persistence.Embeddable")
+}
+
+tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJar") {
+	archiveFileName.set("jobvis-api.jar")
 }
 
 tasks.withType<Test> {

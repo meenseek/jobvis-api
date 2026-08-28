@@ -109,7 +109,7 @@ GET http://localhost:8080/actuator/health
 ```bash
 ./gradlew cleanTest test --rerun-tasks
 ./gradlew bootJar
-docker build -t jobvis-api:0.0.1 .
+docker build -t jobvis-api:local .
 ```
 
 통합 테스트는 실제 `postgres:18.4-alpine`에서 Flyway 재실행, 인증 경계, 테넌트 격리, 상태 불변식, 멱등성, 낙관적 잠금, 가져오기→초안→수락, 지원당 일정 1개, Calendar 확인, 통계를 검증합니다.
