@@ -2,6 +2,14 @@
 
 Jobvis API는 특정 클라우드 SDK에 의존하지 않는 OCI 컨테이너와 PostgreSQL로 구성됩니다. CPU·스토리지·네트워크·컨테이너 실행 환경을 제공하는 클라우드라면 동일 이미지를 사용할 수 있습니다. 모두의 AI 실험실에도 이 경계를 전제로 올릴 수 있지만, 실제 계정에 영구 PostgreSQL 볼륨·고정 공개 주소·TLS 인그레스가 제공되는지는 배포 전에 콘솔에서 확인해야 합니다.
 
+## Migration history
+
+2026-08-29 기준 Flyway V1과 V2는 애플리케이션 데이터가 있는 비폐기 PostgreSQL에
+적용되어 있습니다. `meenseek` Jobvis 데이터 운영자가 이 이력을 소유하며 기존 migration은
+append-only로 보존합니다. 모든 V1·V2 database를 검증된 백업·복구로 새 baseline DB에
+이전하고 이전 DB와 그 이력에 의존하는 애플리케이션을 폐기한 경우에만 이 보존 의무가
+끝납니다.
+
 ## 필수 런타임
 
 - Java 17 컨테이너 실행 환경

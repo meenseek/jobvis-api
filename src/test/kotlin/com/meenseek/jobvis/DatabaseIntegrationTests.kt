@@ -5,6 +5,7 @@ import com.meenseek.jobvis.imports.ImportRetentionWorker
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.flywaydb.core.Flyway
+import org.flywaydb.core.api.MigrationVersion
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.context.SpringBootTest
@@ -30,8 +31,56 @@ class DatabaseIntegrationTests @Autowired constructor(
 ) : PostgresIntegrationTest() {
 	@Test
 	fun `빈 DB 마이그레이션은 완료되고 재실행은 안전하다`() {
-		assertThat(flyway.info().current().version.version).isEqualTo("2")
+		assertThat(flyway.info().pending()).isEmpty()
 		assertThat(flyway.migrate().migrationsExecuted).isZero()
+	}
+
+	@Test
+	fun `V1 데이터는 V2 마이그레이션 뒤에도 보존된다`() {
+		val schema = "migration_upgrade_${UUID.randomUUID().toString().replace("-", "")}"
+		val quotedSchema = "\"$schema\""
+		jdbcTemplate.execute("CREATE SCHEMA $quotedSchema")
+		try {
+			val v1Flyway = Flyway.configure()
+				.dataSource(dataSource)
+				.locations("classpath:db/migration")
+				.schemas(schema)
+				.defaultSchema(schema)
+				.target(MigrationVersion.fromVersion("1"))
+				.load()
+			assertThat(v1Flyway.migrate().migrationsExecuted).isOne()
+
+			val userId = UUID.randomUUID()
+			jdbcTemplate.update(
+				"INSERT INTO $quotedSchema.users (id, created_at, updated_at) VALUES (?, clock_timestamp(), clock_timestamp())",
+				userId,
+			)
+
+			val currentFlyway = Flyway.configure()
+				.dataSource(dataSource)
+				.locations("classpath:db/migration")
+				.schemas(schema)
+				.defaultSchema(schema)
+				.target(MigrationVersion.fromVersion("2"))
+				.load()
+			assertThat(currentFlyway.migrate().migrationsExecuted).isOne()
+			assertThat(currentFlyway.info().pending()).isEmpty()
+			assertThat(
+				jdbcTemplate.queryForObject(
+					"SELECT COUNT(*) FROM $quotedSchema.users WHERE id = ?",
+					Long::class.java,
+					userId,
+				),
+			).isOne()
+			assertThat(
+				jdbcTemplate.queryForObject(
+					"SELECT COUNT(*) FROM $quotedSchema.gmail_quota_gates",
+					Long::class.java,
+				),
+			).isZero()
+		} finally {
+			jdbcTemplate.execute("DROP SCHEMA $quotedSchema CASCADE")
+		}
 	}
 
 	@Test
