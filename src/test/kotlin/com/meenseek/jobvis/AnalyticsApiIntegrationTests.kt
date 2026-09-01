@@ -43,6 +43,7 @@ class AnalyticsApiIntegrationTests @Autowired constructor(
 		val offeredId = createApplication(userId, "오퍼 회사", "offer")
 		val rejectedId = createApplication(userId, "탈락 회사", "screening")
 		createApplication(userId, "진행 회사", "applied")
+		createApplication(userId, "과제 회사", "test")
 		createApplication(otherUserId, "다른 사용자 회사", "offer")
 		jdbcTemplate.update(
 			"UPDATE applications SET result = 'OFFERED', screening_passed = true WHERE id = ?",
@@ -59,17 +60,16 @@ class AnalyticsApiIntegrationTests @Autowired constructor(
 				.param("to", "2026-08-17")
 				.header(USER_HEADER, userId),
 		).andExpect(status().isOk)
-			.andExpect(jsonPath("$.total").value(3))
-			.andExpect(jsonPath("$.active").value(1))
-			.andExpect(jsonPath("$.offered").value(1))
-			.andExpect(jsonPath("$.rejected").value(1))
+			.andExpect(jsonPath("$.from").value("2026-01-01"))
+			.andExpect(jsonPath("$.to").value("2026-08-17"))
+			.andExpect(jsonPath("$.total").value(4))
 			.andExpect(jsonPath("$.screeningPassed").value(1))
 			.andExpect(jsonPath("$.reachedInterview").value(1))
-			.andExpect(jsonPath("$.byStage.applied").value(1))
-			.andExpect(jsonPath("$.byStage.screening").value(1))
-			.andExpect(jsonPath("$.byStage.offer").value(1))
-			.andExpect(jsonPath("$.screeningPassRate").value(0.3333))
-			.andExpect(jsonPath("$.offerRate").value(0.3333))
+			.andExpect(jsonPath("$.offered").value(1))
+			.andExpect(jsonPath("$.monthlyFlow.length()").value(6))
+			.andExpect(jsonPath("$.monthlyFlow[5].month").value("2026-08"))
+			.andExpect(jsonPath("$.monthlyFlow[5].count").value(4))
+			.andExpect(jsonPath("$.sourceCounts.manual").value(4))
 
 		mockMvc.perform(
 			get("/api/v1/analytics/summary")
@@ -90,7 +90,7 @@ class AnalyticsApiIntegrationTests @Autowired constructor(
 							"mutationId" to UUID.randomUUID(),
 							"company" to company,
 							"position" to "백엔드 엔지니어",
-							"stage" to stage,
+							"status" to stage,
 						),
 					),
 				),

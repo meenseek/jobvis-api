@@ -1,0 +1,1396 @@
+openapi: 3.1.0
+info:
+  title: Jobvis API
+  version: 1.0.0
+  description: Canonical HTTP contract for Jobvis v1, including the current web client surface.
+servers:
+  - url: /api/v1
+security:
+  - bearerAuth: []
+paths:
+  /auth/providers:
+    get:
+      operationId: listLoginProviders
+      security: []
+      responses:
+        '200':
+          description: Login provider configuration.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/LoginProviderResponse' }
+  /auth/challenges:
+    post:
+      operationId: createLoginChallenge
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateLoginChallengeRequest' }
+      responses:
+        '201':
+          description: One-time login challenge.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginChallenge' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /auth/exchange:
+    post:
+      operationId: exchangeIdentityToken
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExchangeIdentityTokenRequest' }
+      responses:
+        '200':
+          description: Server-issued opaque session.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthSession' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /auth/me:
+    get:
+      operationId: getCurrentUser
+      responses:
+        '200':
+          description: Current authenticated user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthUser' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/logout:
+    post:
+      operationId: logout
+      responses:
+        '204':
+          description: Session revoked or already absent.
+  /connections/capabilities:
+    get:
+      operationId: listConnectionCapabilities
+      responses:
+        '200':
+          description: Provider capabilities and current availability.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ConnectionCapability' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /connections:
+    get:
+      operationId: listConnections
+      parameters:
+        - name: capability
+          in: query
+          schema: { type: string, enum: [mail, calendar] }
+        - name: includeRevoked
+          in: query
+          schema: { type: boolean, default: true }
+      responses:
+        '200':
+          description: Connections owned by the current user.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ExternalConnection' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /connections/naver:
+    post:
+      operationId: connectNaverMail
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConnectNaverRequest' }
+      responses:
+        '201':
+          description: Validated and encrypted Naver mail connection.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExternalConnection' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /connections/{provider}/oauth/begin:
+    post:
+      operationId: beginConnectionOAuth
+      parameters:
+        - $ref: '#/components/parameters/OAuthConnectionProvider'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BeginOAuthConnectionRequest' }
+      responses:
+        '200':
+          description: Provider authorization URL.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BeginOAuthConnectionResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /connections/{provider}/oauth/complete:
+    post:
+      operationId: completeConnectionOAuth
+      parameters:
+        - $ref: '#/components/parameters/OAuthConnectionProvider'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompleteOAuthConnectionRequest' }
+      responses:
+        '201':
+          description: Connected provider account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExternalConnection' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/FailedDependency' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /connections/{connectionId}/monitoring-consent:
+    patch:
+      operationId: updateConnectionMonitoringConsent
+      parameters:
+        - $ref: '#/components/parameters/ConnectionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateMonitoringConsentRequest' }
+      responses:
+        '200':
+          description: Updated connection.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExternalConnection' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /connections/{connectionId}/monitoring/resume:
+    post:
+      operationId: resumeConnectionMonitoring
+      parameters:
+        - $ref: '#/components/parameters/ConnectionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResumeMonitoringRequest' }
+      responses:
+        '200':
+          description: Resumed connection.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExternalConnection' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /connections/{connectionId}:
+    delete:
+      operationId: revokeConnection
+      parameters:
+        - $ref: '#/components/parameters/ConnectionId'
+      responses:
+        '204': { description: Connection revoked. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /import-runs:
+    get:
+      operationId: listImportRuns
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: size
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+      responses:
+        '200':
+          description: Import runs ordered newest first.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportRunPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      operationId: createImportRun
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateImportRunRequest' }
+      responses:
+        '202':
+          description: Queued or replayed import run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportRun' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /import-runs/{runId}:
+    get:
+      operationId: getImportRun
+      parameters:
+        - $ref: '#/components/parameters/ImportRunId'
+      responses:
+        '200':
+          description: Import run state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportRun' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /import-runs/{runId}/cancel:
+    post:
+      operationId: cancelImportRun
+      parameters:
+        - $ref: '#/components/parameters/ImportRunId'
+      responses:
+        '200':
+          description: Cancelled import run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportRun' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /applications:
+    post:
+      operationId: createApplication
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateApplicationRequest' }
+      responses:
+        '201':
+          description: Created application.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Application' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /applications/counts:
+    get:
+      operationId: getApplicationCounts
+      responses:
+        '200':
+          description: Unfiltered application count.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationCounts' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /applications/page:
+    get:
+      operationId: listApplicationPage
+      parameters:
+        - $ref: '#/components/parameters/ApplicationQuery'
+        - $ref: '#/components/parameters/ApplicationStatusFilter'
+        - name: page
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+      responses:
+        '200':
+          description: A bounded application page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /applications/{applicationId}:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationId'
+    get:
+      operationId: getApplication
+      responses:
+        '200':
+          description: Core application detail; histories are fetched from their bounded endpoints.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Application' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /applications/{applicationId}/details:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationId'
+    patch:
+      operationId: updateApplicationDetails
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateApplicationDetailsRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/ApplicationResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /applications/{applicationId}/memo:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationId'
+    put:
+      operationId: updateApplicationMemo
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateMemoRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/ApplicationResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /applications/{applicationId}/status:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationId'
+    post:
+      operationId: updateApplicationStatus
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateStatusRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/ApplicationResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /applications/{applicationId}/schedule:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationId'
+    get:
+      operationId: getApplicationSchedule
+      responses:
+        '200':
+          description: Full all-day or timed schedule.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationSchedule' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      operationId: patchApplicationSchedule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PatchScheduleRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/ApplicationResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    put:
+      operationId: replaceApplicationSchedule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReplaceScheduleRequest' }
+      responses:
+        '200':
+          description: Replaced schedule.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationSchedule' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /applications/{applicationId}/schedule/complete:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationId'
+    post:
+      operationId: completeApplicationSchedule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MutationRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/ApplicationResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /applications/{applicationId}/review/complete:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationId'
+    post:
+      operationId: completeApplicationReview
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MutationRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/ApplicationResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /applications/review/complete-bulk:
+    post:
+      operationId: completeAllApplicationReviews
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompleteBulkReviewRequest' }
+      responses:
+        '200':
+          description: Review completion result for the current review revision.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CompleteBulkReviewResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /applications/{applicationId}/activities/{activityId}:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationId'
+      - name: activityId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      operationId: deleteApplicationActivity
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MutationRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/ApplicationResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /applications/{applicationId}/emails:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationId'
+      - $ref: '#/components/parameters/HistoryBefore'
+      - $ref: '#/components/parameters/HistoryLimit'
+    get:
+      operationId: listApplicationEmails
+      responses:
+        '200':
+          description: Email history page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmailHistoryPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /applications/{applicationId}/activities:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationId'
+      - $ref: '#/components/parameters/HistoryBefore'
+      - $ref: '#/components/parameters/HistoryLimit'
+    get:
+      operationId: listApplicationActivities
+      responses:
+        '200':
+          description: Activity history page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActivityHistoryPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /applications/{applicationId}/changes:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationId'
+      - $ref: '#/components/parameters/HistoryBefore'
+      - $ref: '#/components/parameters/HistoryLimit'
+    get:
+      operationId: listApplicationChanges
+      responses:
+        '200':
+          description: Change history page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChangeHistoryPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /home/summary:
+    get:
+      operationId: getHomeSummary
+      responses:
+        '200':
+          description: Bounded data needed by the home route.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HomeSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /calendar/schedules:
+    get:
+      operationId: listCalendarSchedules
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          required: true
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: Incomplete schedules in an inclusive range of at most 62 days.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CalendarSchedulePage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /analytics/summary:
+    get:
+      operationId: getApplicationAnalytics
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: Application analytics for an optional inclusive date range.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationAnalytics' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /activities/recent:
+    get:
+      operationId: listRecentActivities
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+        - name: type
+          in: query
+          schema: { $ref: '#/components/schemas/ActivityType' }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+      responses:
+        '200':
+          description: Recent activities in an inclusive range of at most 31 days.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RecentActivity' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /calendar-exports/previews:
+    post:
+      operationId: createCalendarExportPreview
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateCalendarPreviewRequest' }
+      responses:
+        '201':
+          description: Persisted export preview.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CalendarExport' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /calendar-exports/{exportId}:
+    parameters:
+      - $ref: '#/components/parameters/CalendarExportId'
+    get:
+      operationId: getCalendarExport
+      responses:
+        '200':
+          description: Calendar export state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CalendarExport' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /calendar-exports/{exportId}/confirm:
+    parameters:
+      - $ref: '#/components/parameters/CalendarExportId'
+    post:
+      operationId: confirmCalendarExport
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConfirmCalendarExportRequest' }
+      responses:
+        '200':
+          description: Confirmed or replayed calendar export.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CalendarExport' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/FailedDependency' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    OAuthConnectionProvider:
+      name: provider
+      in: path
+      required: true
+      schema: { type: string, enum: [gmail, outlook, google_calendar] }
+    ConnectionId:
+      name: connectionId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ImportRunId:
+      name: runId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ApplicationId:
+      name: applicationId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    CalendarExportId:
+      name: exportId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ApplicationQuery:
+      name: q
+      in: query
+      schema: { type: string }
+    ApplicationStatusFilter:
+      name: status
+      in: query
+      schema:
+        $ref: '#/components/schemas/ApplicationFilter'
+    HistoryBefore:
+      name: before
+      in: query
+      schema: { type: integer, format: int64 }
+    HistoryLimit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+  responses:
+    ApplicationResponse:
+      description: Updated application.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Application' }
+    BadRequest:
+      description: Invalid request.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetail' }
+    Unauthorized:
+      description: Authentication is required.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetail' }
+    NotFound:
+      description: Owned resource was not found.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetail' }
+    Conflict:
+      description: Mutation id or optimistic version conflict.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetail' }
+    TooManyRequests:
+      description: Request rate limit exceeded.
+      headers:
+        Retry-After:
+          required: true
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetail' }
+    ServiceUnavailable:
+      description: A required provider or service is unavailable.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetail' }
+    FailedDependency:
+      description: The external provider requires another action.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetail' }
+  schemas:
+    LoginProvider:
+      type: string
+      enum: [google, kakao]
+    LoginProviderResponse:
+      type: object
+      required: [provider, configured]
+      properties:
+        provider: { $ref: '#/components/schemas/LoginProvider' }
+        configured: { type: boolean }
+    CreateLoginChallengeRequest:
+      type: object
+      required: [provider]
+      properties:
+        provider: { $ref: '#/components/schemas/LoginProvider' }
+    ExchangeIdentityTokenRequest:
+      type: object
+      required: [provider, idToken, challengeToken, nonce]
+      properties:
+        provider: { $ref: '#/components/schemas/LoginProvider' }
+        idToken: { type: string, minLength: 1, maxLength: 16000 }
+        challengeToken: { type: string, minLength: 1, maxLength: 255 }
+        nonce: { type: string, minLength: 1, maxLength: 255 }
+    LoginChallenge:
+      type: object
+      required: [challengeToken, nonce, expiresAt]
+      properties:
+        challengeToken: { type: string }
+        nonce: { type: string }
+        expiresAt: { type: string, format: date-time }
+    AuthUser:
+      type: object
+      required: [id, displayName, primaryEmail]
+      properties:
+        id: { type: string, format: uuid }
+        displayName: { type: [string, 'null'] }
+        primaryEmail: { type: [string, 'null'] }
+    AuthSession:
+      type: object
+      required: [accessToken, tokenType, expiresAt, user]
+      properties:
+        accessToken: { type: string }
+        tokenType: { type: string, const: Bearer }
+        expiresAt: { type: string, format: date-time }
+        user: { $ref: '#/components/schemas/AuthUser' }
+    ConnectionProvider:
+      type: string
+      enum: [gmail, outlook, naver, google_calendar]
+    ConnectionCapability:
+      type: object
+      required:
+        - provider
+        - capability
+        - connectionMode
+        - available
+        - supportsHistoricalImport
+        - supportsOngoingSync
+        - notes
+      properties:
+        provider: { $ref: '#/components/schemas/ConnectionProvider' }
+        capability: { type: string, enum: [mail, calendar] }
+        connectionMode: { type: string, enum: [oauth2, app_password] }
+        available: { type: boolean }
+        supportsHistoricalImport: { type: boolean }
+        supportsOngoingSync: { type: boolean }
+        notes:
+          type: array
+          items: { type: string }
+    ExternalConnection:
+      type: object
+      required:
+        - id
+        - provider
+        - capability
+        - accountEmail
+        - status
+        - ongoingSyncConsent
+        - lastSyncedAt
+        - nextSyncAfter
+        - lastErrorCode
+        - monitoringPaused
+        - tokenExpiresAt
+        - grantedScopes
+        - version
+      properties:
+        id: { type: string, format: uuid }
+        provider: { $ref: '#/components/schemas/ConnectionProvider' }
+        capability: { type: string, enum: [mail, calendar] }
+        accountEmail: { type: string, format: email }
+        status:
+          type: string
+          enum: [connected, reauthorization_required, error, revoked]
+        ongoingSyncConsent: { type: boolean }
+        lastSyncedAt: { type: [string, 'null'], format: date-time }
+        nextSyncAfter: { type: [string, 'null'], format: date-time }
+        lastErrorCode: { type: [string, 'null'] }
+        monitoringPaused: { type: boolean }
+        tokenExpiresAt: { type: [string, 'null'], format: date-time }
+        grantedScopes:
+          type: array
+          uniqueItems: true
+          items: { type: string }
+        version: { type: integer, format: int64, minimum: 0 }
+    ConnectNaverRequest:
+      type: object
+      additionalProperties: false
+      required: [accountEmail, appPassword, ongoingSyncConsent]
+      properties:
+        accountEmail: { type: string, format: email, maxLength: 320 }
+        appPassword: { type: string, minLength: 1, maxLength: 255 }
+        ongoingSyncConsent: { type: boolean }
+    BeginOAuthConnectionRequest:
+      type: object
+      additionalProperties: false
+      required: [redirectUri]
+      properties:
+        redirectUri: { type: string, minLength: 1, maxLength: 1000 }
+    BeginOAuthConnectionResponse:
+      type: object
+      required: [provider, authorizationUrl, expiresAt]
+      properties:
+        provider: { $ref: '#/components/schemas/ConnectionProvider' }
+        authorizationUrl: { type: string, format: uri }
+        expiresAt: { type: string, format: date-time }
+    CompleteOAuthConnectionRequest:
+      type: object
+      additionalProperties: false
+      required: [state, code, ongoingSyncConsent]
+      properties:
+        state: { type: string, minLength: 1, maxLength: 500 }
+        code: { type: string, minLength: 1, maxLength: 4000 }
+        ongoingSyncConsent: { type: boolean }
+    UpdateMonitoringConsentRequest:
+      type: object
+      additionalProperties: false
+      required: [expectedVersion, enabled]
+      properties:
+        expectedVersion: { type: integer, format: int64, minimum: 0 }
+        enabled: { type: boolean }
+    ResumeMonitoringRequest:
+      type: object
+      additionalProperties: false
+      required: [expectedVersion]
+      properties:
+        expectedVersion: { type: integer, format: int64, minimum: 0 }
+    CreateImportRunRequest:
+      type: object
+      additionalProperties: false
+      required: [mutationId, connectionId]
+      properties:
+        mutationId: { type: string, format: uuid }
+        connectionId: { type: string, format: uuid }
+        dateFrom: { type: string, format: date }
+        dateTo: { type: string, format: date }
+      dependentRequired:
+        dateFrom: [dateTo]
+        dateTo: [dateFrom]
+    ImportRun:
+      type: object
+      required:
+        - id
+        - connectionId
+        - connectionVersion
+        - provider
+        - requestedBy
+        - dateFrom
+        - dateTo
+        - status
+        - scannedCount
+        - finalizedCount
+        - ignoredCount
+        - duplicateCount
+        - errorCode
+        - startedAt
+        - completedAt
+        - purgeAfter
+        - createdAt
+      properties:
+        id: { type: string, format: uuid }
+        connectionId: { type: string, format: uuid }
+        connectionVersion: { type: integer, format: int64, minimum: 0 }
+        provider: { $ref: '#/components/schemas/ConnectionProvider' }
+        requestedBy: { type: string, enum: [user, monitor] }
+        dateFrom: { type: string, format: date }
+        dateTo: { type: string, format: date }
+        status: { type: string, enum: [queued, running, completed, failed, cancelled] }
+        scannedCount: { type: integer, minimum: 0 }
+        finalizedCount: { type: integer, minimum: 0 }
+        ignoredCount: { type: integer, minimum: 0 }
+        duplicateCount: { type: integer, minimum: 0 }
+        errorCode: { type: [string, 'null'] }
+        startedAt: { type: [string, 'null'], format: date-time }
+        completedAt: { type: [string, 'null'], format: date-time }
+        purgeAfter: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+    ImportRunPage:
+      type: object
+      required: [items, page, size, hasNext]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ImportRun' }
+        page: { type: integer, minimum: 0 }
+        size: { type: integer, minimum: 1 }
+        hasNext: { type: boolean }
+    ApplicationStatus:
+      type: string
+      enum: [applied, screening, test, interview, offer, offered, rejected]
+    ApplicationFilter:
+      type: string
+      default: all
+      enum: [all, review, application, test, interview, offer, offered, rejected, schedulable]
+    ApplicationSourceType:
+      type: string
+      enum: [manual, gmail, outlook, naver, other]
+    ScheduleType:
+      type: string
+      enum: [application, test, interview, followup, other]
+    ActivityType:
+      type: string
+      enum: [email, note, status, task]
+    MutationRequest:
+      type: object
+      additionalProperties: false
+      required: [mutationId, expectedVersion]
+      properties:
+        mutationId: { type: string, format: uuid }
+        expectedVersion: { type: integer, format: int64, minimum: 0 }
+    CreateApplicationRequest:
+      type: object
+      additionalProperties: false
+      required: [mutationId, company, position, status]
+      properties:
+        mutationId: { type: string, format: uuid }
+        company: { type: string, minLength: 1, maxLength: 160 }
+        position: { type: string, minLength: 1, maxLength: 160 }
+        status: { type: string, enum: [applied, screening, test, interview, offer] }
+    UpdateApplicationDetailsRequest:
+      type: object
+      additionalProperties: false
+      required: [mutationId, expectedVersion, company, position, location, employmentType, appliedAt]
+      properties:
+        mutationId: { type: string, format: uuid }
+        expectedVersion: { type: integer, format: int64, minimum: 0 }
+        company: { type: string, minLength: 1, maxLength: 160 }
+        position: { type: string, minLength: 1, maxLength: 160 }
+        location: { type: [string, 'null'], maxLength: 160 }
+        employmentType: { type: [string, 'null'], maxLength: 80 }
+        appliedAt: { type: string, format: date }
+    UpdateMemoRequest:
+      type: object
+      additionalProperties: false
+      required: [mutationId, expectedVersion, memo]
+      properties:
+        mutationId: { type: string, format: uuid }
+        expectedVersion: { type: integer, format: int64, minimum: 0 }
+        memo: { type: string, maxLength: 20000 }
+    UpdateStatusRequest:
+      type: object
+      additionalProperties: false
+      required: [mutationId, expectedVersion, status]
+      properties:
+        mutationId: { type: string, format: uuid }
+        expectedVersion: { type: integer, format: int64, minimum: 0 }
+        status: { $ref: '#/components/schemas/ApplicationStatus' }
+    PatchScheduleRequest:
+      type: object
+      additionalProperties: false
+      required: [mutationId, expectedVersion]
+      properties:
+        mutationId: { type: string, format: uuid }
+        expectedVersion: { type: integer, format: int64, minimum: 0 }
+        nextActionAt: { type: string, format: date }
+        nextActionTitle: { type: string, maxLength: 200 }
+      anyOf:
+        - required: [nextActionAt]
+        - required: [nextActionTitle]
+    ReplaceScheduleRequest:
+      type: object
+      additionalProperties: false
+      required: [mutationId, expectedVersion, scheduleType, action, scheduledAt, endsAt, timezone, location, description]
+      properties:
+        mutationId: { type: string, format: uuid }
+        expectedVersion: { type: integer, format: int64, minimum: 0 }
+        expectedScheduleVersion: { type: integer, format: int64, minimum: 0 }
+        scheduleType: { $ref: '#/components/schemas/ScheduleType' }
+        action: { type: string, minLength: 1, maxLength: 200 }
+        scheduledAt: { type: string, format: date-time }
+        endsAt: { type: [string, 'null'], format: date-time }
+        timezone: { type: string, minLength: 1, maxLength: 80 }
+        location: { type: string, maxLength: 300 }
+        description: { type: string, maxLength: 4000 }
+    ApplicationListItem:
+      type: object
+      additionalProperties: false
+      required: [id, version, company, position, appliedAt, status, needsReview, source]
+      properties:
+        id: { type: string, format: uuid }
+        version: { type: integer, format: int64, minimum: 0 }
+        company: { type: string }
+        position: { type: string }
+        appliedAt: { type: string, format: date }
+        status: { $ref: '#/components/schemas/ApplicationStatus' }
+        needsReview: { type: boolean }
+        source: { type: string }
+    Application:
+      type: object
+      additionalProperties: false
+      required: [id, version, company, position, location, employmentType, appliedAt, status, needsReview, source, sourceType, schedule, memo]
+      properties:
+        id: { type: string, format: uuid }
+        version: { type: integer, format: int64, minimum: 0 }
+        company: { type: string }
+        position: { type: string }
+        location: { type: string }
+        employmentType: { type: string }
+        appliedAt: { type: string, format: date }
+        status: { $ref: '#/components/schemas/ApplicationStatus' }
+        needsReview: { type: boolean }
+        source: { type: string }
+        sourceType: { $ref: '#/components/schemas/ApplicationSourceType' }
+        schedule:
+          oneOf:
+            - $ref: '#/components/schemas/ApplicationScheduleSummary'
+            - type: 'null'
+        memo: { type: string }
+    ApplicationScheduleSummary:
+      type: object
+      additionalProperties: false
+      required: [nextActionTitle, nextActionAt]
+      properties:
+        nextActionTitle: { type: string }
+        nextActionAt: { type: string, format: date }
+    ApplicationPage:
+      type: object
+      additionalProperties: false
+      required: [items, page, limit, hasNext, filteredCount, totalCount, needsReviewCount, reviewRevision]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ApplicationListItem' } }
+        page: { type: integer, minimum: 0 }
+        limit: { type: integer, minimum: 1 }
+        hasNext: { type: boolean }
+        filteredCount: { type: integer, format: int64, minimum: 0 }
+        totalCount: { type: integer, format: int64, minimum: 0 }
+        needsReviewCount: { type: integer, format: int64, minimum: 0 }
+        reviewRevision: { type: integer, format: int64, minimum: 0 }
+    ApplicationCounts:
+      type: object
+      additionalProperties: false
+      required: [totalCount]
+      properties:
+        totalCount: { type: integer, format: int64, minimum: 0 }
+    CompleteBulkReviewRequest:
+      type: object
+      additionalProperties: false
+      required: [mutationId, expectedReviewRevision]
+      properties:
+        mutationId: { type: string, format: uuid }
+        expectedReviewRevision: { type: integer, format: int64, minimum: 0 }
+    CompleteBulkReviewResponse:
+      type: object
+      additionalProperties: false
+      required: [completedCount, needsReviewCount, reviewRevision]
+      properties:
+        completedCount: { type: integer, minimum: 0 }
+        needsReviewCount: { type: integer, format: int64, minimum: 0 }
+        reviewRevision: { type: integer, format: int64, minimum: 0 }
+    ApplicationEmail:
+      type: object
+      additionalProperties: false
+      required: [id, subject, sender, receivedAt, summary]
+      properties:
+        id: { type: string, format: uuid }
+        subject: { type: string }
+        sender: { type: string }
+        receivedAt: { type: string, format: date-time }
+        summary: { type: string }
+    ApplicationActivity:
+      type: object
+      additionalProperties: false
+      required: [id, type, title, description, occurredAt]
+      properties:
+        id: { type: string, format: uuid }
+        type: { $ref: '#/components/schemas/ActivityType' }
+        title: { type: string }
+        description: { type: string }
+        occurredAt: { type: string, format: date-time }
+    ApplicationChange:
+      type: object
+      additionalProperties: false
+      required: [id, title, description, occurredAt]
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        description: { type: string }
+        occurredAt: { type: string, format: date-time }
+    ApplicationSchedule:
+      oneOf:
+        - $ref: '#/components/schemas/AllDayApplicationSchedule'
+        - $ref: '#/components/schemas/TimedApplicationSchedule'
+    AllDayApplicationSchedule:
+      type: object
+      additionalProperties: false
+      required: [id, applicationId, applicationVersion, version, scheduleType, action, allDay, date, scheduledAt, endsAt, timezone, location, description, completed, completedAt]
+      properties:
+        id: { type: string, format: uuid }
+        applicationId: { type: string, format: uuid }
+        applicationVersion: { type: integer, format: int64, minimum: 0 }
+        version: { type: integer, format: int64, minimum: 0 }
+        scheduleType: { $ref: '#/components/schemas/ScheduleType' }
+        action: { type: string }
+        allDay: { type: boolean, const: true }
+        date: { type: string, format: date }
+        scheduledAt: { type: 'null' }
+        endsAt: { type: 'null' }
+        timezone: { type: 'null' }
+        location: { type: string }
+        description: { type: string }
+        completed: { type: boolean }
+        completedAt: { type: [string, 'null'], format: date-time }
+    TimedApplicationSchedule:
+      type: object
+      additionalProperties: false
+      required: [id, applicationId, applicationVersion, version, scheduleType, action, allDay, date, scheduledAt, endsAt, timezone, location, description, completed, completedAt]
+      properties:
+        id: { type: string, format: uuid }
+        applicationId: { type: string, format: uuid }
+        applicationVersion: { type: integer, format: int64, minimum: 0 }
+        version: { type: integer, format: int64, minimum: 0 }
+        scheduleType: { $ref: '#/components/schemas/ScheduleType' }
+        action: { type: string }
+        allDay: { type: boolean, const: false }
+        date: { type: 'null' }
+        scheduledAt: { type: string, format: date-time }
+        endsAt: { type: [string, 'null'], format: date-time }
+        timezone: { type: string }
+        location: { type: string }
+        description: { type: string }
+        completed: { type: boolean }
+        completedAt: { type: [string, 'null'], format: date-time }
+    EmailHistoryPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor, totalCount]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ApplicationEmail' } }
+        nextCursor: { type: [integer, 'null'], format: int64 }
+        totalCount: { type: integer, format: int64, minimum: 0 }
+    ActivityHistoryPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ApplicationActivity' } }
+        nextCursor: { type: [integer, 'null'], format: int64 }
+    ChangeHistoryPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor, totalCount]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ApplicationChange' } }
+        nextCursor: { type: [integer, 'null'], format: int64 }
+        totalCount: { type: integer, format: int64, minimum: 0 }
+    HomeSummary:
+      type: object
+      additionalProperties: false
+      required: [date, briefing, priorityItems, upcomingSchedules, activeApplications]
+      properties:
+        date: { type: string, format: date }
+        briefing: { $ref: '#/components/schemas/HomeBriefing' }
+        priorityItems: { type: array, maxItems: 5, items: { $ref: '#/components/schemas/HomePriorityItem' } }
+        upcomingSchedules: { type: array, maxItems: 5, items: { $ref: '#/components/schemas/HomeUpcomingSchedule' } }
+        activeApplications: { type: array, maxItems: 5, items: { $ref: '#/components/schemas/HomeActiveApplication' } }
+    HomeBriefing:
+      type: object
+      additionalProperties: false
+      required: [reason, count]
+      properties:
+        reason:
+          type: string
+          enum: [needsReview, openTask, upcomingSchedule, idle]
+        count: { type: integer, format: int64, minimum: 0 }
+    HomePriorityItem:
+      type: object
+      additionalProperties: false
+      required: [applicationId, applicationVersion, company, position, reason, scheduleType, nextActionAt, canComplete]
+      properties:
+        applicationId: { type: string, format: uuid }
+        applicationVersion: { type: integer, format: int64, minimum: 0 }
+        company: { type: string }
+        position: { type: string }
+        reason:
+          type: string
+          enum: [needsReview, overdue, today]
+        scheduleType:
+          oneOf:
+            - $ref: '#/components/schemas/ScheduleType'
+            - type: 'null'
+        nextActionAt: { type: [string, 'null'], format: date }
+        canComplete: { type: boolean }
+    HomeUpcomingSchedule:
+      type: object
+      additionalProperties: false
+      required: [applicationId, company, position, scheduleType, date]
+      properties:
+        applicationId: { type: string, format: uuid }
+        company: { type: string }
+        position: { type: string }
+        scheduleType: { $ref: '#/components/schemas/ScheduleType' }
+        date: { type: string, format: date }
+    HomeActiveApplication:
+      type: object
+      additionalProperties: false
+      required: [applicationId, company, position, status, needsReview, nextActionAt, latestActivityTitle]
+      properties:
+        applicationId: { type: string, format: uuid }
+        company: { type: string }
+        position: { type: string }
+        status: { $ref: '#/components/schemas/ApplicationStatus' }
+        needsReview: { type: boolean }
+        nextActionAt: { type: [string, 'null'], format: date }
+        latestActivityTitle: { type: string }
+    CalendarSchedulePage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/CalendarScheduleItem' } }
+    CalendarScheduleItem:
+      type: object
+      additionalProperties: false
+      required: [applicationId, company, position, status, needsReview, title, date]
+      properties:
+        applicationId: { type: string, format: uuid }
+        company: { type: string }
+        position: { type: string }
+        status: { $ref: '#/components/schemas/ApplicationStatus' }
+        needsReview: { type: boolean }
+        title: { type: string }
+        date: { type: string, format: date }
+    ApplicationAnalytics:
+      type: object
+      additionalProperties: false
+      required: [from, to, total, screeningPassed, reachedInterview, offered, monthlyFlow, sourceCounts]
+      properties:
+        from: { type: [string, 'null'], format: date }
+        to: { type: string, format: date }
+        total: { type: integer, format: int64, minimum: 0 }
+        screeningPassed: { type: integer, format: int64, minimum: 0 }
+        reachedInterview: { type: integer, format: int64, minimum: 0 }
+        offered: { type: integer, format: int64, minimum: 0 }
+        monthlyFlow: { type: array, items: { $ref: '#/components/schemas/MonthlyFlow' } }
+        sourceCounts:
+          type: object
+          additionalProperties: false
+          description: Sparse counts keyed by the canonical application source type.
+          properties:
+            gmail: { type: integer, format: int64, minimum: 0 }
+            naver: { type: integer, format: int64, minimum: 0 }
+            outlook: { type: integer, format: int64, minimum: 0 }
+            manual: { type: integer, format: int64, minimum: 0 }
+            other: { type: integer, format: int64, minimum: 0 }
+    MonthlyFlow:
+      type: object
+      additionalProperties: false
+      required: [month, count]
+      properties:
+        month: { type: string, pattern: '^\d{4}-\d{2}$' }
+        count: { type: integer, format: int64, minimum: 0 }
+    RecentActivity:
+      type: object
+      additionalProperties: false
+      required: [id, applicationId, company, position, type, title, description, occurredAt]
+      properties:
+        id: { type: string, format: uuid }
+        applicationId: { type: string, format: uuid }
+        company: { type: string }
+        position: { type: string }
+        type: { $ref: '#/components/schemas/ActivityType' }
+        title: { type: string }
+        description: { type: string }
+        occurredAt: { type: string, format: date-time }
+    CreateCalendarPreviewRequest:
+      type: object
+      additionalProperties: false
+      required: [scheduleId, connectionId, idempotencyKey, expectedScheduleVersion]
+      properties:
+        scheduleId: { type: string, format: uuid }
+        connectionId: { type: string, format: uuid }
+        idempotencyKey: { type: string, format: uuid }
+        expectedScheduleVersion: { type: integer, format: int64, minimum: 0 }
+    ConfirmCalendarExportRequest:
+      type: object
+      additionalProperties: false
+      required: [previewHash]
+      properties:
+        previewHash: { type: string, minLength: 1 }
+    CalendarExport:
+      type: object
+      additionalProperties: false
+      required: [id, scheduleId, connectionId, scheduleVersion, previewHash, title, startsAt, endsAt, timezone, location, description, status, providerEventId, errorCode, confirmedAt, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        scheduleId: { type: string, format: uuid }
+        connectionId: { type: string, format: uuid }
+        scheduleVersion: { type: integer, format: int64, minimum: 0 }
+        previewHash: { type: string }
+        title: { type: string }
+        startsAt: { type: string, format: date-time }
+        endsAt: { type: string, format: date-time }
+        timezone: { type: string }
+        location: { type: string }
+        description: { type: string }
+        status: { type: string, enum: [previewed, confirming, confirmed, failed] }
+        providerEventId: { type: [string, 'null'] }
+        errorCode: { type: [string, 'null'] }
+        confirmedAt: { type: [string, 'null'], format: date-time }
+        createdAt: { type: string, format: date-time }
+    ProblemDetail:
+      type: object
+      additionalProperties: true
+      required: [title, status, detail]
+      properties:
+        type: { type: string, format: uri-reference, default: about:blank }
+        title: { type: string }
+        status: { type: integer, minimum: 400, maximum: 599 }
+        detail: { type: string }
+        instance: { type: string, format: uri-reference }

@@ -32,12 +32,12 @@ class LoginRateLimiter(
 			cleanupExpired(now)
 			val current = windows[key]
 			if (current != null && current.expiresAt.isAfter(now)) {
-				if (current.count >= maxRequests) tooManyRequests()
+				if (current.count >= maxRequests) tooManyRequests(Duration.between(now, current.expiresAt))
 				windows[key] = current.copy(count = current.count + 1)
 				return
 			}
 			windows.remove(key)
-			if (windows.size >= maxTrackedClients) tooManyRequests()
+			if (windows.size >= maxTrackedClients) tooManyRequests(window)
 			windows[key] = RequestWindow(1, now.plus(window))
 		}
 	}
@@ -51,8 +51,13 @@ class LoginRateLimiter(
 		nextCleanupAt = now.plusSeconds(1)
 	}
 
-	private fun tooManyRequests(): Nothing =
-		throw TooManyRequestsException("로그인 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.")
+	private fun tooManyRequests(retryAfter: Duration): Nothing {
+		val retryAfterSeconds = retryAfter.seconds + if (retryAfter.nano > 0) 1 else 0
+		throw TooManyRequestsException(
+			"로그인 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.",
+			retryAfterSeconds.coerceAtLeast(1),
+		)
+	}
 
 	private data class RequestWindow(val count: Int, val expiresAt: Instant)
 }

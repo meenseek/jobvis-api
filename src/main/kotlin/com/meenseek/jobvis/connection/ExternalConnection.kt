@@ -154,6 +154,25 @@ class ExternalConnection private constructor(
 		storedRevokedAt = null
 	}
 
+	fun preserveNaverLedgerMigrationBlock(now: Instant) {
+		require(storedProvider == ConnectionProvider.NAVER)
+		storedStatus = ConnectionStatus.ERROR
+		storedOngoingSyncConsent = false
+		storedNextSyncAfter = null
+		storedLastErrorCode = "NAVER_LEDGER_MIGRATION_REQUIRED"
+		storedUpdatedAt = now
+	}
+
+	fun completeNaverLedgerMigration(now: Instant) {
+		require(storedProvider == ConnectionProvider.NAVER)
+		require(storedLastErrorCode == "NAVER_LEDGER_MIGRATION_REQUIRED")
+		storedStatus = ConnectionStatus.CONNECTED
+		storedOngoingSyncConsent = false
+		storedNextSyncAfter = null
+		storedLastErrorCode = null
+		storedUpdatedAt = now
+	}
+
 	fun updateMonitoringConsent(enabled: Boolean, now: Instant) {
 		require(provider.capability == ConnectionCapability.MAIL) { "메일 연결만 자동 확인 동의를 변경할 수 있습니다." }
 		storedOngoingSyncConsent = enabled

@@ -1,18 +1,17 @@
 package com.meenseek.jobvis.analytics
 
-import java.math.BigDecimal
 import java.time.LocalDate
+import java.time.YearMonth
 
 data class ApplicationAnalyticsResponse(
-	val from: LocalDate,
+	val from: LocalDate?,
 	val to: LocalDate,
 	val total: Long,
-	val active: Long,
-	val offered: Long,
-	val rejected: Long,
 	val screeningPassed: Long,
 	val reachedInterview: Long,
-	val byStage: Map<String, Long>,
-	val screeningPassRate: BigDecimal,
-	val offerRate: BigDecimal,
+	val offered: Long,
+	val monthlyFlow: List<MonthlyFlowResponse>,
+	val sourceCounts: Map<String, Long>,
 )
+
+data class MonthlyFlowResponse(val month: YearMonth, val count: Long)

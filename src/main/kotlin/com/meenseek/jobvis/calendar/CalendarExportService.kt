@@ -47,6 +47,8 @@ class CalendarExportService(
 		val application = findApplication(userId, schedule.applicationId)
 		validateCalendarConnection(userId, request.connectionId)
 		val snapshot = snapshotFactory.create(schedule, application, request.connectionId)
+		val timezone = schedule.timezone
+			?: throw BadRequestException("종일 일정은 시각과 시간대를 지정한 뒤 내보내 주세요.")
 		exportRepository.findByIdempotencyKey(userId, request.idempotencyKey)?.let { existing ->
 			if (existing.scheduleId != request.scheduleId || existing.previewHash != snapshot.previewHash) {
 				throw ConflictException("이미 다른 캘린더 미리보기에 사용된 idempotencyKey입니다.")
@@ -57,7 +59,7 @@ class CalendarExportService(
 		exportRepository.reservePreview(
 			UUID.randomUUID(), userId, schedule.id, request.connectionId, schedule.version,
 			snapshot.previewHash, request.idempotencyKey, snapshot.title, snapshot.startsAt,
-			snapshot.endsAt, schedule.timezone, schedule.location, snapshot.description, now,
+			snapshot.endsAt, timezone, schedule.location, snapshot.description, now,
 		)
 		exportRepository.findByIdempotencyKey(userId, request.idempotencyKey)?.let { existing ->
 			if (existing.scheduleId != request.scheduleId || existing.previewHash != snapshot.previewHash) {
@@ -212,7 +214,11 @@ class CalendarSnapshotFactory {
 		application: JobApplication,
 		connectionId: UUID,
 	): CalendarSnapshot {
+		if (schedule.allDay) {
+			throw BadRequestException("종일 일정은 시각과 시간대를 지정한 뒤 내보내 주세요.")
+		}
 		val startsAt = schedule.scheduledAt ?: throw BadRequestException("시작 시각이 있는 일정만 내보낼 수 있습니다.")
+		val timezone = schedule.timezone ?: throw BadRequestException("일정 시간대를 지정해 주세요.")
 		val endsAt = schedule.endsAt ?: startsAt.plusSeconds(3600)
 		val title = "${application.company} · ${schedule.action}".take(200)
 		val description = listOf(
@@ -221,7 +227,7 @@ class CalendarSnapshotFactory {
 		).filter(String::isNotBlank).joinToString("\n").take(4000)
 		val hash = RequestFingerprint.of(
 			"CALENDAR_PREVIEW", schedule.id, schedule.version, connectionId,
-			title, startsAt, endsAt, schedule.timezone, schedule.location, description,
+			title, startsAt, endsAt, timezone, schedule.location, description,
 		)
 		return CalendarSnapshot(hash, title, startsAt, endsAt, description)
 	}

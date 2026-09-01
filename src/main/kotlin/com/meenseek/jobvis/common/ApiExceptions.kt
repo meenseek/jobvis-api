@@ -24,4 +24,7 @@ class ExternalConnectionAuthorizationException(
 	val connectionVersion: Long? = null,
 ) : ApiException(HttpStatus.FAILED_DEPENDENCY, message)
 
-class TooManyRequestsException(message: String) : ApiException(HttpStatus.TOO_MANY_REQUESTS, message)
+class TooManyRequestsException(
+	message: String,
+	val retryAfterSeconds: Long = 60,
+) : ApiException(HttpStatus.TOO_MANY_REQUESTS, message)

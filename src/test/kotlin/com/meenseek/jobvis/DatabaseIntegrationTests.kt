@@ -2,6 +2,13 @@ package com.meenseek.jobvis
 
 import com.meenseek.jobvis.imports.GmailQuotaGate
 import com.meenseek.jobvis.imports.ImportRetentionWorker
+import com.meenseek.jobvis.imports.MailFinalizationRolloutService
+import com.meenseek.jobvis.imports.NaverLedgerReconciliationEntry
+import com.meenseek.jobvis.imports.NaverLedgerReconciliationFile
+import com.meenseek.jobvis.imports.NaverLedgerReconciliationResult
+import com.meenseek.jobvis.imports.NaverLedgerReconciliationService
+import com.meenseek.jobvis.imports.lockMailFinalizationRollout
+import com.meenseek.jobvis.common.ConflictException
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.flywaydb.core.Flyway
@@ -11,7 +18,10 @@ import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.context.SpringBootTest
 import org.springframework.dao.DataIntegrityViolationException
 import org.springframework.jdbc.core.JdbcTemplate
+import org.springframework.jdbc.datasource.DataSourceTransactionManager
+import org.springframework.jdbc.datasource.SingleConnectionDataSource
 import org.springframework.test.context.ActiveProfiles
+import org.springframework.transaction.support.TransactionTemplate
 import java.sql.Date
 import java.sql.Timestamp
 import java.time.Clock
@@ -19,6 +29,10 @@ import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import javax.sql.DataSource
 
 @SpringBootTest
@@ -27,6 +41,7 @@ class DatabaseIntegrationTests @Autowired constructor(
 	private val flyway: Flyway,
 	private val jdbcTemplate: JdbcTemplate,
 	private val gmailQuotaGate: GmailQuotaGate,
+	private val naverLedgerReconciliationService: NaverLedgerReconciliationService,
 	private val dataSource: DataSource,
 ) : PostgresIntegrationTest() {
 	@Test
@@ -80,6 +95,467 @@ class DatabaseIntegrationTests @Autowired constructor(
 			).isZero()
 		} finally {
 			jdbcTemplate.execute("DROP SCHEMA $quotedSchema CASCADE")
+		}
+	}
+
+	@Test
+	fun `V3 preflight는 모든 legacy 충돌을 변경 전에 막고 정리 뒤 TEST 단계를 승격한다`() {
+		val schema = "migration_test_stage_${UUID.randomUUID().toString().replace("-", "")}"
+		val quotedSchema = "\"$schema\""
+		jdbcTemplate.execute("CREATE SCHEMA $quotedSchema")
+		try {
+			val v2Flyway = Flyway.configure()
+				.dataSource(dataSource)
+				.locations("classpath:db/migration")
+				.schemas(schema)
+				.defaultSchema(schema)
+				.target(MigrationVersion.fromVersion("2"))
+				.load()
+			assertThat(v2Flyway.migrate().migrationsExecuted).isEqualTo(2)
+
+			val now = Instant.parse("2026-08-17T00:00:00Z")
+			val userId = UUID.randomUUID()
+			val promotedApplicationId = UUID.randomUUID()
+			val preservedApplicationId = UUID.randomUUID()
+			jdbcTemplate.update(
+				"INSERT INTO $quotedSchema.users (id, created_at, updated_at) VALUES (?, ?, ?)",
+				userId,
+				Timestamp.from(now),
+				Timestamp.from(now),
+			)
+			fun insertV2Application(id: UUID, stage: String, highest: String, passed: Boolean, result: String) {
+				jdbcTemplate.update(
+					"""
+						INSERT INTO $quotedSchema.applications (
+						    id, user_id, company, position, location, employment_type, applied_at,
+						    stage, highest_stage_reached, screening_passed, result, needs_review,
+						    source, memo, creation_mutation_id, last_mutation_id, version, created_at, updated_at
+						) VALUES (?, ?, '회사', '포지션', '', '', ?, ?, ?, ?, ?, false,
+						          '메일', '', ?, ?, 0, ?, ?)
+					""".trimIndent(),
+					id, userId, Date.valueOf("2026-08-17"), stage, highest, passed, result,
+					UUID.randomUUID(), UUID.randomUUID(), Timestamp.from(now), Timestamp.from(now),
+				)
+				jdbcTemplate.update(
+					"""
+						INSERT INTO $quotedSchema.application_schedules (
+						    id, user_id, application_id, schedule_type, action, scheduled_at,
+						    completed, completed_at, created_at, updated_at
+						) VALUES (?, ?, ?, 'TEST', '코딩 테스트', ?, false, NULL, ?, ?)
+					""".trimIndent(),
+					UUID.randomUUID(), userId, id, Timestamp.from(now), Timestamp.from(now), Timestamp.from(now),
+				)
+			}
+			insertV2Application(promotedApplicationId, "SCREENING", "SCREENING", false, "ACTIVE")
+			insertV2Application(preservedApplicationId, "INTERVIEW", "INTERVIEW", true, "ACTIVE")
+
+			val connectionId = UUID.randomUUID()
+			val runId = UUID.randomUUID()
+			val draftId = UUID.randomUUID()
+			val rejectedDraftId = UUID.randomUUID()
+			jdbcTemplate.update(
+				"""
+					INSERT INTO $quotedSchema.external_connections (
+					    id, user_id, provider, account_email, credential_kind, encrypted_access_token,
+					    granted_scopes, status, ongoing_sync_consent, consented_at, version, created_at, updated_at
+					) VALUES (?, ?, 'GMAIL', 'test@example.com', 'OAUTH2', 'token',
+					          'mail.read', 'CONNECTED', false, ?, 0, ?, ?)
+				""".trimIndent(),
+				connectionId, userId, Timestamp.from(now), Timestamp.from(now), Timestamp.from(now),
+			)
+			jdbcTemplate.update(
+				"""
+					INSERT INTO $quotedSchema.import_runs (
+					    id, user_id, connection_id, connection_version, provider, requested_by,
+					    date_from, date_to, status, purge_after, created_at, updated_at
+					) VALUES (?, ?, ?, 0, 'GMAIL', 'USER', ?, ?, 'QUEUED', ?, ?, ?)
+				""".trimIndent(),
+				runId, userId, connectionId, Date.valueOf("2026-08-01"), Date.valueOf("2026-08-17"),
+				Timestamp.from(now.plusSeconds(86_400)), Timestamp.from(now), Timestamp.from(now),
+			)
+			jdbcTemplate.update(
+				"""
+					INSERT INTO $quotedSchema.import_drafts (
+					    id, user_id, run_id, connection_id, provider, provider_message_id, subject, sender,
+					    received_at, source_summary, company, position, location, employment_type, applied_at,
+					    stage, highest_stage_reached, screening_passed, result, schedule_type, schedule_action,
+					    scheduled_at, confidence, status, purge_after, created_at, updated_at
+					) VALUES (?, ?, ?, ?, 'GMAIL', 'message-1', '코딩 테스트', 'sender@example.com',
+					          ?, '요약', '회사', '포지션', '', '', ?, 'APPLIED', 'SCREENING', false, 'ACTIVE',
+					          'TEST', '코딩 테스트', ?, 0.900, 'PENDING', ?, ?, ?)
+				""".trimIndent(),
+				draftId, userId, runId, connectionId, Timestamp.from(now), Date.valueOf("2026-08-17"),
+				Timestamp.from(now), Timestamp.from(now.plusSeconds(86_400)), Timestamp.from(now), Timestamp.from(now),
+			)
+			jdbcTemplate.update(
+				"""
+					INSERT INTO $quotedSchema.import_drafts (
+					    id, user_id, run_id, connection_id, provider, provider_message_id, subject, sender,
+					    received_at, source_summary, company, position, location, employment_type, applied_at,
+					    stage, highest_stage_reached, screening_passed, result, schedule_type, schedule_action,
+					    scheduled_at, confidence, status, decision_mutation_id, decision_fingerprint, decided_at,
+					    purge_after, created_at, updated_at
+					) VALUES (?, ?, ?, ?, 'GMAIL', 'message-2', '코딩 테스트', 'sender@example.com',
+					          ?, '요약', '회사', '포지션', '', '', ?, 'SCREENING', 'SCREENING', false, 'ACTIVE',
+					          'TEST', '코딩 테스트', ?, 0.900, 'REJECTED', ?, ?, ?, ?, ?, ?)
+				""".trimIndent(),
+				rejectedDraftId, userId, runId, connectionId, Timestamp.from(now), Date.valueOf("2026-08-17"),
+				Timestamp.from(now), UUID.randomUUID(), "a".repeat(64), Timestamp.from(now),
+				Timestamp.from(now.plusSeconds(86_400)), Timestamp.from(now), Timestamp.from(now),
+			)
+
+			val v3Flyway = Flyway.configure()
+				.dataSource(dataSource)
+				.locations("classpath:db/migration")
+				.schemas(schema)
+				.defaultSchema(schema)
+				.target(MigrationVersion.fromVersion("3"))
+				.load()
+			assertThatThrownBy { v3Flyway.migrate() }
+				.rootCause()
+				.hasMessageContaining(
+					"V3 preflight requires every legacy PENDING import draft to be accepted or rejected",
+				)
+			assertThat(
+				jdbcTemplate.queryForMap(
+					"SELECT stage, highest_stage_reached FROM $quotedSchema.applications WHERE id = ?",
+					promotedApplicationId,
+				),
+			).containsEntry("stage", "SCREENING").containsEntry("highest_stage_reached", "SCREENING")
+
+			jdbcTemplate.update("DELETE FROM $quotedSchema.import_drafts WHERE id = ?", draftId)
+			val conflictingConnectionId = UUID.randomUUID()
+			jdbcTemplate.update(
+				"""
+					INSERT INTO $quotedSchema.external_connections (
+					    id, user_id, provider, account_email, credential_kind, encrypted_access_token,
+					    granted_scopes, status, ongoing_sync_consent, consented_at, version, created_at, updated_at
+					) VALUES (?, ?, 'GMAIL', 'other@example.com', 'OAUTH2', 'token',
+					          'mail.read', 'CONNECTED', false, ?, 0, ?, ?)
+				""".trimIndent(),
+				conflictingConnectionId, userId, Timestamp.from(now), Timestamp.from(now), Timestamp.from(now),
+			)
+			assertThatThrownBy { v3Flyway.migrate() }
+				.rootCause()
+				.hasMessageContaining(
+					"V3 preflight requires explicit reconciliation of users with multiple active MAIL connections",
+				)
+			jdbcTemplate.update(
+				"DELETE FROM $quotedSchema.external_connections WHERE id = ?",
+				conflictingConnectionId,
+			)
+
+			jdbcTemplate.update(
+				"UPDATE $quotedSchema.application_schedules SET scheduled_at = NULL WHERE application_id = ?",
+				promotedApplicationId,
+			)
+			assertThatThrownBy { v3Flyway.migrate() }
+				.rootCause()
+				.hasMessageContaining(
+					"V3 preflight requires every legacy application schedule to have scheduled_at",
+				)
+			jdbcTemplate.update(
+				"UPDATE $quotedSchema.application_schedules SET scheduled_at = ? WHERE application_id = ?",
+				Timestamp.from(now),
+				promotedApplicationId,
+			)
+
+			assertThat(v3Flyway.migrate().migrationsExecuted).isOne()
+			assertThat(
+				jdbcTemplate.queryForMap(
+					"SELECT stage, highest_stage_reached FROM $quotedSchema.applications WHERE id = ?",
+					promotedApplicationId,
+				),
+			).containsEntry("stage", "TEST").containsEntry("highest_stage_reached", "TEST")
+			assertThat(
+				jdbcTemplate.queryForMap(
+					"SELECT stage, highest_stage_reached FROM $quotedSchema.applications WHERE id = ?",
+					preservedApplicationId,
+				),
+			).containsEntry("stage", "INTERVIEW").containsEntry("highest_stage_reached", "INTERVIEW")
+			assertThat(
+				jdbcTemplate.queryForMap(
+					"SELECT stage, highest_stage_reached, status FROM $quotedSchema.import_drafts WHERE id = ?",
+					rejectedDraftId,
+				),
+			).containsEntry("stage", "SCREENING")
+				.containsEntry("highest_stage_reached", "SCREENING")
+				.containsEntry("status", "REJECTED")
+
+			assertThatThrownBy {
+				jdbcTemplate.update(
+					"""
+						UPDATE $quotedSchema.applications
+						SET stage = 'TEST', highest_stage_reached = 'SCREENING'
+						WHERE id = ?
+					""".trimIndent(),
+					promotedApplicationId,
+				)
+			}.isInstanceOf(DataIntegrityViolationException::class.java)
+		} finally {
+			jdbcTemplate.execute("DROP SCHEMA $quotedSchema CASCADE")
+		}
+	}
+
+	@Test
+	fun `V9 rollout은 pending을 기다리고 orphan을 제거한 뒤 target constraint를 한 번만 설치한다`() {
+		val schema = "migration_mail_rollout_${UUID.randomUUID().toString().replace("-", "")}"
+		val quotedSchema = "\"$schema\""
+		jdbcTemplate.execute("CREATE SCHEMA $quotedSchema")
+		try {
+			val schemaFlyway = Flyway.configure()
+				.dataSource(dataSource)
+				.locations("classpath:db/migration")
+				.schemas(schema)
+				.defaultSchema(schema)
+				.target(MigrationVersion.fromVersion("9"))
+				.load()
+			assertThat(schemaFlyway.migrate().migrationsExecuted).isEqualTo(9)
+
+			dataSource.connection.use { connection ->
+				connection.createStatement().use { it.execute("SET search_path TO $quotedSchema") }
+				try {
+					val scopedDataSource = SingleConnectionDataSource(connection, true)
+					val scoped = JdbcTemplate(scopedDataSource)
+					val rollout = MailFinalizationRolloutService(scoped, Clock.fixed(NOW, java.time.ZoneOffset.UTC))
+					val transaction = TransactionTemplate(DataSourceTransactionManager(scopedDataSource))
+					val userId = UUID.randomUUID()
+					val connectionId = UUID.randomUUID()
+					val runId = UUID.randomUUID()
+					val draftId = UUID.randomUUID()
+					val ledgerId = UUID.randomUUID()
+
+					scoped.update(
+						"INSERT INTO users (id, created_at, updated_at) VALUES (?, ?, ?)",
+						userId, Timestamp.from(NOW), Timestamp.from(NOW),
+					)
+					scoped.update(
+						"""
+							INSERT INTO external_connections (
+							    id, user_id, provider, account_email, credential_kind, encrypted_access_token,
+							    granted_scopes, status, ongoing_sync_consent, consented_at, version, created_at, updated_at
+							) VALUES (?, ?, 'GMAIL', 'rollout@example.com', 'OAUTH2', 'encrypted',
+							          'mail.read', 'CONNECTED', false, ?, 0, ?, ?)
+						""".trimIndent(),
+						connectionId, userId, Timestamp.from(NOW), Timestamp.from(NOW), Timestamp.from(NOW),
+					)
+					scoped.update(
+						"""
+							INSERT INTO import_runs (
+							    id, user_id, connection_id, connection_version, provider, requested_by,
+							    mutation_id, request_fingerprint,
+							    date_from, date_to, status, completed_at, purge_after, created_at, updated_at
+							) VALUES (?, ?, ?, 0, 'GMAIL', 'USER', ?, ?, ?, ?, 'COMPLETED', ?, ?, ?, ?)
+						""".trimIndent(),
+						runId, userId, connectionId, UUID.randomUUID(), "test-fixture",
+						Date.valueOf("2026-08-01"), Date.valueOf("2026-08-17"),
+						Timestamp.from(NOW), Timestamp.from(NOW.plusSeconds(86_400)),
+						Timestamp.from(NOW), Timestamp.from(NOW),
+					)
+					scoped.update(
+						"""
+							INSERT INTO import_drafts (
+							    id, user_id, run_id, connection_id, provider, provider_message_id,
+							    subject, sender, received_at, source_summary, company, position,
+							    location, employment_type, applied_at, stage, highest_stage_reached,
+							    screening_passed, result, confidence, status, purge_after, created_at, updated_at
+							) VALUES (?, ?, ?, ?, 'GMAIL', 'legacy-message', '지원 접수', 'sender@example.com',
+							          ?, '요약', '회사', '포지션', '', '', ?, 'APPLIED', 'APPLIED',
+							          false, 'ACTIVE', 0.900, 'PENDING', ?, ?, ?)
+						""".trimIndent(),
+						draftId, userId, runId, connectionId, Timestamp.from(NOW), Date.valueOf("2026-08-17"),
+						Timestamp.from(NOW.plusSeconds(86_400)), Timestamp.from(NOW), Timestamp.from(NOW),
+					)
+					scoped.update(
+						"""
+							INSERT INTO mail_ingestion_ledger (
+							    id, user_id, connection_id, provider_message_id, state, first_seen_at, updated_at
+							) VALUES (?, ?, ?, 'legacy-message', 'DRAFTED', ?, ?)
+						""".trimIndent(),
+						ledgerId, userId, connectionId, Timestamp.from(NOW), Timestamp.from(NOW),
+					)
+
+					assertThat(transaction.execute { rollout.reconcileAndCompleteIfReady() }).isFalse()
+					assertThat(scoped.queryForObject(
+						"SELECT completed_at IS NULL FROM mail_finalization_rollout_state WHERE singleton = true",
+						Boolean::class.java,
+					)).isTrue()
+					scoped.update("DELETE FROM import_drafts WHERE id = ?", draftId)
+
+					val acceptedApplicationId = UUID.randomUUID()
+					val acceptedLedgerId = UUID.randomUUID()
+					scoped.update(
+						"""
+							INSERT INTO applications (
+							    id, user_id, company, position, location, employment_type, applied_at,
+							    stage, highest_stage_reached, screening_passed, result, needs_review,
+							    source, source_type, memo, creation_mutation_id, last_mutation_id,
+							    version, created_at, updated_at
+							) VALUES (?, ?, '회사', '포지션', '', '', ?, 'APPLIED', 'APPLIED', false,
+							          'ACTIVE', false, 'Gmail 메일', 'GMAIL', '', ?, ?, 0, ?, ?)
+						""".trimIndent(),
+						acceptedApplicationId, userId, Date.valueOf("2026-08-17"), UUID.randomUUID(),
+						UUID.randomUUID(), Timestamp.from(NOW), Timestamp.from(NOW),
+					)
+					scoped.update(
+						"""
+							INSERT INTO application_emails (
+							    id, user_id, application_id, connection_id, provider, provider_message_id,
+							    subject, sender, received_at, summary, created_at
+							) VALUES (?, ?, ?, ?, 'GMAIL', 'accepted-without-draft', '지원 접수',
+							          'sender@example.com', ?, '요약', ?)
+						""".trimIndent(),
+						UUID.randomUUID(), userId, acceptedApplicationId, connectionId,
+						Timestamp.from(NOW), Timestamp.from(NOW),
+					)
+					scoped.update(
+						"""
+							INSERT INTO mail_ingestion_ledger (
+							    id, user_id, connection_id, provider_message_id, state, first_seen_at, updated_at
+							) VALUES (?, ?, ?, 'accepted-without-draft', 'ACCEPTED', ?, ?)
+						""".trimIndent(),
+						acceptedLedgerId, userId, connectionId, Timestamp.from(NOW), Timestamp.from(NOW),
+					)
+
+					assertThat(transaction.execute { rollout.reconcileAndCompleteIfReady() }).isTrue()
+					assertThat(transaction.execute { rollout.reconcileAndCompleteIfReady() }).isTrue()
+					assertThat(scoped.queryForObject(
+						"SELECT orphan_drafted_deleted_count FROM mail_finalization_rollout_state WHERE singleton = true",
+						Long::class.java,
+					)).isEqualTo(1)
+					assertThat(scoped.queryForMap(
+						"SELECT state, application_id FROM mail_ingestion_ledger WHERE id = ?",
+						acceptedLedgerId,
+					)).containsEntry("state", "FINALIZED")
+						.containsEntry("application_id", acceptedApplicationId)
+					assertThat(scoped.queryForList(
+						"""
+							SELECT conname FROM pg_constraint
+							WHERE connamespace = current_schema()::regnamespace
+							  AND conname IN (
+							      'ck_mail_ingestion_ledger_state_target',
+							      'ck_import_drafts_status_target',
+							      'ck_import_drafts_decision_target'
+							  )
+							ORDER BY conname
+						""".trimIndent(),
+						String::class.java,
+					)).containsExactly(
+						"ck_import_drafts_decision_target",
+						"ck_import_drafts_status_target",
+						"ck_mail_ingestion_ledger_state_target",
+					)
+					assertThatThrownBy {
+						scoped.update(
+							"""
+								INSERT INTO mail_ingestion_ledger (
+								    id, user_id, connection_id, provider_message_id, state, first_seen_at, updated_at
+								) VALUES (?, ?, ?, 'late-draft', 'DRAFTED', ?, ?)
+							""".trimIndent(),
+							UUID.randomUUID(), userId, connectionId, Timestamp.from(NOW), Timestamp.from(NOW),
+						)
+					}.isInstanceOf(DataIntegrityViolationException::class.java)
+					assertThatThrownBy {
+						scoped.update(
+							"""
+								INSERT INTO mail_ingestion_ledger (
+								    id, user_id, connection_id, provider_message_id, state, first_seen_at, updated_at
+								) VALUES (?, ?, ?, 'unowned-finalized', 'FINALIZED', ?, ?)
+							""".trimIndent(),
+							UUID.randomUUID(), userId, connectionId, Timestamp.from(NOW), Timestamp.from(NOW),
+						)
+					}.isInstanceOf(DataIntegrityViolationException::class.java)
+				} finally {
+					connection.createStatement().use { it.execute("RESET search_path") }
+				}
+			}
+		} finally {
+			jdbcTemplate.execute("DROP SCHEMA $quotedSchema CASCADE")
+		}
+	}
+
+	@Test
+	fun `Naver reconciliation은 rollout과 직렬화하고 정확한 증빙을 멱등 적용한다`() {
+		val userId = UUID.randomUUID()
+		val connectionId = UUID.randomUUID()
+		val ledgerId = UUID.randomUUID()
+		val operationId = UUID.randomUUID()
+		insertUser(userId, NOW)
+		val releaseRolloutLock = CountDownLatch(1)
+		val executor = Executors.newFixedThreadPool(2)
+		try {
+			jdbcTemplate.update(
+				"""
+					INSERT INTO external_connections (
+					    id, user_id, provider, account_email, credential_kind, encrypted_app_password,
+					    granted_scopes, status, ongoing_sync_consent, consented_at, last_error_code,
+					    version, created_at, updated_at
+					) VALUES (?, ?, 'NAVER', 'migration@naver.com', 'APP_PASSWORD', 'encrypted',
+					          'imap.readonly', 'ERROR', false, ?, 'NAVER_LEDGER_MIGRATION_REQUIRED', 0, ?, ?)
+				""".trimIndent(),
+				connectionId, userId, Timestamp.from(NOW), Timestamp.from(NOW), Timestamp.from(NOW),
+			)
+			jdbcTemplate.update(
+				"""
+					INSERT INTO mail_ingestion_ledger (
+					    id, user_id, connection_id, provider_message_id, state, first_seen_at, updated_at
+				) VALUES (?, ?, ?, 'legacy-uid', 'IGNORED', ?, ?)
+				""".trimIndent(),
+				ledgerId, userId, connectionId, Timestamp.from(NOW), Timestamp.from(NOW),
+			)
+			val request = NaverLedgerReconciliationFile(
+				operationId = operationId,
+				connectionId = connectionId,
+				expectedLedgerCount = 1,
+				expectedStateCounts = mapOf("IGNORED" to 1),
+				reconciledBy = "operator@example.com",
+				entries = listOf(
+					NaverLedgerReconciliationEntry(
+						ledgerId = ledgerId,
+						disposition = "STABLE_KEY",
+						stableProviderMessageKey = "a".repeat(64),
+						evidenceType = "PROVIDER_REFETCH",
+						evidenceReference = "secure-ops-ticket-123",
+					),
+				),
+			)
+
+			val rolloutLockAcquired = CountDownLatch(1)
+			val transaction = TransactionTemplate(DataSourceTransactionManager(dataSource))
+			val lockFuture = executor.submit {
+				transaction.executeWithoutResult {
+					jdbcTemplate.lockMailFinalizationRollout()
+					rolloutLockAcquired.countDown()
+					check(releaseRolloutLock.await(10, TimeUnit.SECONDS))
+				}
+			}
+			assertThat(rolloutLockAcquired.await(10, TimeUnit.SECONDS)).isTrue()
+			val reconciliationStarted = CountDownLatch(1)
+			val reconciliationFuture = executor.submit<NaverLedgerReconciliationResult> {
+				reconciliationStarted.countDown()
+				naverLedgerReconciliationService.reconcile(request)
+			}
+			assertThat(reconciliationStarted.await(10, TimeUnit.SECONDS)).isTrue()
+			assertThatThrownBy { reconciliationFuture.get(250, TimeUnit.MILLISECONDS) }
+				.isInstanceOf(TimeoutException::class.java)
+			releaseRolloutLock.countDown()
+			assertThat(reconciliationFuture.get(10, TimeUnit.SECONDS).stableKeyCount).isEqualTo(1)
+			lockFuture.get(10, TimeUnit.SECONDS)
+
+			assertThat(naverLedgerReconciliationService.reconcile(request).stableKeyCount).isEqualTo(1)
+			assertThat(jdbcTemplate.queryForMap(
+				"SELECT status, last_error_code FROM external_connections WHERE id = ?", connectionId,
+			)).containsEntry("status", "CONNECTED").containsEntry("last_error_code", null)
+			assertThatThrownBy {
+				naverLedgerReconciliationService.reconcile(
+					request.copy(reconciledBy = "another-operator@example.com"),
+				)
+			}.isInstanceOf(ConflictException::class.java)
+		} finally {
+			releaseRolloutLock.countDown()
+			executor.shutdownNow()
+			check(executor.awaitTermination(10, TimeUnit.SECONDS))
+			jdbcTemplate.update("DELETE FROM users WHERE id = ?", userId)
 		}
 	}
 
@@ -198,13 +674,14 @@ class DatabaseIntegrationTests @Autowired constructor(
 			jdbcTemplate.update(
 				"""
 					INSERT INTO application_schedules (
-					    id, user_id, application_id, schedule_type, action, scheduled_at,
+					    id, user_id, application_id, schedule_type, action, scheduled_at, timezone,
 					    completed, completed_at, created_at, updated_at
-					) VALUES (?, ?, ?, 'OTHER', '세부 정보 보완', NULL, false, NULL, ?, ?)
+					) VALUES (?, ?, ?, 'OTHER', '세부 정보 보완', ?, 'Asia/Seoul', false, NULL, ?, ?)
 				""".trimIndent(),
 				UUID.randomUUID(),
 				anotherUserId,
 				applicationId,
+				Timestamp.from(now),
 				Timestamp.from(now),
 				Timestamp.from(now),
 			)
@@ -285,9 +762,10 @@ class DatabaseIntegrationTests @Autowired constructor(
 				INSERT INTO applications (
 				    id, user_id, company, position, location, employment_type, applied_at,
 				    stage, highest_stage_reached, screening_passed, result, needs_review,
-				    source, memo, creation_mutation_id, last_mutation_id, version, created_at, updated_at
+				    source, source_type, memo, creation_mutation_id, last_mutation_id,
+				    version, created_at, updated_at
 				) VALUES (?, ?, '회사', '포지션', '서울', '정규직', ?, 'APPLIED', 'APPLIED',
-				          false, 'ACTIVE', false, '직접 추가', '', ?, ?, 0, ?, ?)
+				          false, 'ACTIVE', false, '직접 추가', 'MANUAL', '', ?, ?, 0, ?, ?)
 			""".trimIndent(),
 			applicationId,
 			userId,
@@ -303,15 +781,20 @@ class DatabaseIntegrationTests @Autowired constructor(
 		jdbcTemplate.update(
 			"""
 				INSERT INTO application_schedules (
-				    id, user_id, application_id, schedule_type, action, scheduled_at,
+				    id, user_id, application_id, schedule_type, action, scheduled_at, timezone,
 				    completed, completed_at, created_at, updated_at
-				) VALUES (?, ?, ?, 'OTHER', '세부 정보 보완', NULL, false, NULL, ?, ?)
+				) VALUES (?, ?, ?, 'OTHER', '세부 정보 보완', ?, 'Asia/Seoul', false, NULL, ?, ?)
 			""".trimIndent(),
 			UUID.randomUUID(),
 			userId,
 			applicationId,
 			Timestamp.from(now),
 			Timestamp.from(now),
+			Timestamp.from(now),
 		)
+	}
+
+	private companion object {
+		val NOW: Instant = Instant.parse("2026-08-17T00:00:00Z")
 	}
 }

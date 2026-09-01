@@ -27,6 +27,7 @@ class JobApplication private constructor(
 	result: ApplicationResult,
 	needsReview: Boolean,
 	source: String,
+	sourceType: ApplicationSourceType,
 	memo: String,
 	creationMutationId: UUID,
 	lastMutationId: UUID,
@@ -77,6 +78,10 @@ class JobApplication private constructor(
 	@field:Column(name = "source", nullable = false, length = 80)
 	private var storedSource: String = source
 
+	@field:Enumerated(EnumType.STRING)
+	@field:Column(name = "source_type", nullable = false, length = 20)
+	private var storedSourceType: ApplicationSourceType = sourceType
+
 	@field:Column(name = "memo", nullable = false, columnDefinition = "text")
 	private var storedMemo: String = memo
 
@@ -108,14 +113,23 @@ class JobApplication private constructor(
 	val result: ApplicationResult get() = storedResult
 	val needsReview: Boolean get() = storedNeedsReview
 	val source: String get() = storedSource
+	val sourceType: ApplicationSourceType get() = storedSourceType
 	val memo: String get() = storedMemo
 	val version: Long get() = storedVersion
 
-	fun updateDetails(company: String, position: String, location: String, employmentType: String, now: Instant) {
+	fun updateDetails(
+		company: String,
+		position: String,
+		location: String,
+		employmentType: String,
+		appliedAt: LocalDate,
+		now: Instant,
+	) {
 		storedCompany = company
 		storedPosition = position
 		storedLocation = location
 		storedEmploymentType = employmentType
+		storedAppliedAt = appliedAt
 		touch(now)
 	}
 
@@ -134,7 +148,6 @@ class JobApplication private constructor(
 		storedHighestStageReached = storedHighestStageReached.highest(nextStage)
 		storedScreeningPassed = storedScreeningPassed || nextStage.passedScreeningByProgress()
 		storedResult = ApplicationResult.ACTIVE
-		storedNeedsReview = false
 		touch(now)
 	}
 
@@ -143,13 +156,11 @@ class JobApplication private constructor(
 		storedHighestStageReached = ApplicationStage.OFFER
 		storedScreeningPassed = true
 		storedResult = ApplicationResult.OFFERED
-		storedNeedsReview = false
 		touch(now)
 	}
 
 	fun transitionToRejected(now: Instant) {
 		storedResult = ApplicationResult.REJECTED
-		storedNeedsReview = false
 		touch(now)
 	}
 
@@ -185,6 +196,14 @@ class JobApplication private constructor(
 		storedNeedsReview = mergedNeedsReview
 		touch(now)
 		return true
+	}
+
+	fun recordImportedMessage(mutationId: UUID, now: Instant): Boolean {
+		val reviewMembershipAdded = !storedNeedsReview
+		storedNeedsReview = true
+		storedLastMutationId = mutationId
+		touch(now)
+		return reviewMembershipAdded
 	}
 
 	fun markMutation(mutationId: UUID, now: Instant) {
@@ -232,6 +251,7 @@ class JobApplication private constructor(
 			result = ApplicationResult.ACTIVE,
 			needsReview = false,
 			source = "직접 추가",
+			sourceType = ApplicationSourceType.MANUAL,
 			memo = "",
 			creationMutationId = creationMutationId,
 			lastMutationId = creationMutationId,
@@ -254,6 +274,7 @@ class JobApplication private constructor(
 			result: ApplicationResult,
 			needsReview: Boolean,
 			source: String,
+			sourceType: ApplicationSourceType,
 			creationMutationId: UUID,
 			now: Instant,
 		): JobApplication = JobApplication(
@@ -270,6 +291,7 @@ class JobApplication private constructor(
 			result = result,
 			needsReview = needsReview,
 			source = source,
+			sourceType = sourceType,
 			memo = "",
 			creationMutationId = creationMutationId,
 			lastMutationId = creationMutationId,

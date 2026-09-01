@@ -17,7 +17,7 @@ class DisabledAuthenticationIntegrationTests @Autowired constructor(
 	@Test
 	fun `local이 아닌 프로필에서는 사용자 헤더를 신뢰하지 않는다`() {
 		mockMvc.perform(
-			get("/api/v1/applications")
+			get("/api/v1/applications/counts")
 				.header("X-Jobvis-User-Id", UUID.randomUUID()),
 		).andExpect(status().isUnauthorized)
 	}

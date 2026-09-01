@@ -4,6 +4,7 @@ import jakarta.validation.ConstraintViolationException
 import org.springframework.dao.DataIntegrityViolationException
 import org.springframework.http.HttpStatus
 import org.springframework.http.ProblemDetail
+import org.springframework.http.ResponseEntity
 import org.springframework.orm.ObjectOptimisticLockingFailureException
 import org.springframework.web.bind.MethodArgumentNotValidException
 import org.springframework.web.bind.annotation.ExceptionHandler
@@ -12,6 +13,11 @@ import org.springframework.web.method.annotation.HandlerMethodValidationExceptio
 
 @RestControllerAdvice
 class ApiExceptionHandler {
+	@ExceptionHandler(TooManyRequestsException::class)
+	fun handleTooManyRequests(exception: TooManyRequestsException): ResponseEntity<ProblemDetail> =
+		ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+			.header("Retry-After", exception.retryAfterSeconds.coerceAtLeast(1).toString())
+			.body(problem(HttpStatus.TOO_MANY_REQUESTS, exception.message ?: "잠시 후 다시 시도해 주세요."))
 
 	@ExceptionHandler(ApiException::class)
 	fun handleApiException(exception: ApiException): ProblemDetail =

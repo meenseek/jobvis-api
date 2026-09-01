@@ -20,12 +20,14 @@ class ImportRun private constructor(
 	connectionVersion: Long,
 	provider: ConnectionProvider,
 	requestedBy: ImportRequestedBy,
+	mutationId: UUID?,
+	requestFingerprint: String?,
 	dateFrom: LocalDate,
 	dateTo: LocalDate,
 	status: ImportRunStatus,
 	providerCursor: String?,
 	scannedCount: Int,
-	draftCount: Int,
+	finalizedCount: Int,
 	duplicateCount: Int,
 	errorCode: String?,
 	startedAt: Instant?,
@@ -59,6 +61,12 @@ class ImportRun private constructor(
 	@field:Column(name = "requested_by", nullable = false, length = 20)
 	private var storedRequestedBy: ImportRequestedBy = requestedBy
 
+	@field:Column(name = "mutation_id")
+	private var storedMutationId: UUID? = mutationId
+
+	@field:Column(name = "request_fingerprint", length = 64)
+	private var storedRequestFingerprint: String? = requestFingerprint
+
 	@field:Column(name = "date_from", nullable = false)
 	private var storedDateFrom: LocalDate = dateFrom
 
@@ -76,7 +84,7 @@ class ImportRun private constructor(
 	private var storedScannedCount: Int = scannedCount
 
 	@field:Column(name = "draft_count", nullable = false)
-	private var storedDraftCount: Int = draftCount
+	private var storedFinalizedCount: Int = finalizedCount
 
 	@field:Column(name = "duplicate_count", nullable = false)
 	private var storedDuplicateCount: Int = duplicateCount
@@ -117,11 +125,13 @@ class ImportRun private constructor(
 	val connectionVersion: Long get() = storedConnectionVersion
 	val provider: ConnectionProvider get() = storedProvider
 	val requestedBy: ImportRequestedBy get() = storedRequestedBy
+	val requestFingerprint: String? get() = storedRequestFingerprint
 	val dateFrom: LocalDate get() = storedDateFrom
 	val dateTo: LocalDate get() = storedDateTo
 	val status: ImportRunStatus get() = storedStatus
 	val scannedCount: Int get() = storedScannedCount
-	val draftCount: Int get() = storedDraftCount
+	val finalizedCount: Int get() = storedFinalizedCount
+	val ignoredCount: Int get() = (storedScannedCount - storedFinalizedCount - storedDuplicateCount).coerceAtLeast(0)
 	val duplicateCount: Int get() = storedDuplicateCount
 	val errorCode: String? get() = storedErrorCode
 	val startedAt: Instant? get() = storedStartedAt
@@ -133,10 +143,10 @@ class ImportRun private constructor(
 	val purgeAfter: Instant get() = storedPurgeAfter
 	val createdAt: Instant get() = storedCreatedAt
 
-	fun complete(scannedCount: Int, draftCount: Int, duplicateCount: Int, now: Instant) {
+	fun complete(scannedCount: Int, finalizedCount: Int, duplicateCount: Int, now: Instant) {
 		require(storedStatus == ImportRunStatus.RUNNING) { "실행 중인 가져오기만 완료할 수 있습니다." }
 		storedScannedCount = scannedCount
-		storedDraftCount = draftCount
+		storedFinalizedCount = finalizedCount
 		storedDuplicateCount = duplicateCount
 		storedStatus = ImportRunStatus.COMPLETED
 		storedCompletedAt = now
@@ -176,12 +186,15 @@ class ImportRun private constructor(
 			connectionVersion: Long,
 			provider: ConnectionProvider,
 			requestedBy: ImportRequestedBy,
+			mutationId: UUID?,
+			requestFingerprint: String?,
 			dateFrom: LocalDate,
 			dateTo: LocalDate,
 			now: Instant,
 			purgeAfter: Instant,
 		): ImportRun = ImportRun(
-			id, userId, connectionId, connectionVersion, provider, requestedBy, dateFrom, dateTo,
+			id, userId, connectionId, connectionVersion, provider, requestedBy, mutationId, requestFingerprint,
+			dateFrom, dateTo,
 			ImportRunStatus.QUEUED, null, 0, 0, 0, null, null, null,
 			null, null, null, 0, purgeAfter, now, now,
 		)

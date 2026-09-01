@@ -12,6 +12,7 @@ import org.springframework.stereotype.Component
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Propagation
 import org.springframework.transaction.annotation.Transactional
+import org.springframework.transaction.support.TransactionTemplate
 import jakarta.annotation.PreDestroy
 import java.sql.Timestamp
 import java.time.Clock
@@ -148,6 +149,7 @@ class ImportRunWorker(
 				return
 			}
 			val collection = mailCollector.collect(activeConnection, run.dateFrom, run.dateTo)
+			attemptConnectionVersion = collection.connectionVersion
 			if (forceStopping.get()) return
 			completionService.complete(claim, collection)
 		} catch (exception: MailCollectionException) {
@@ -168,6 +170,14 @@ class ImportRunWorker(
 				claim, "IMPORT_SERVICE_TEMPORARILY_UNAVAILABLE", MailFailureDisposition.TRANSIENT,
 				attemptConnectionVersion,
 			)
+		} catch (exception: MailFinalizationException) {
+			if (forceStopping.get()) return
+			completionService.fail(
+				claim, exception.errorCode, MailFailureDisposition.RUN_ONLY, attemptConnectionVersion,
+			)
+		} catch (exception: MailFinalizationCancelledException) {
+			if (forceStopping.get()) return
+			completionService.cancel(claim, exception.errorCode)
 		} catch (_: Exception) {
 			if (forceStopping.get()) return
 			completionService.fail(
@@ -221,9 +231,11 @@ data class ClaimedImportRun(val runId: UUID, val leaseOwner: UUID)
 @Service
 class ImportRunClaimService(
 	private val jdbcTemplate: JdbcTemplate,
+	private val rolloutGate: MailImportRolloutGate,
 ) {
 	@Transactional(propagation = Propagation.REQUIRES_NEW)
 	fun claimNext(): ClaimedImportRun? {
+		if (!rolloutGate.ready()) return null
 		recoverExpired()
 		val leaseOwner = UUID.randomUUID()
 		return jdbcTemplate.query(
@@ -309,75 +321,67 @@ class ImportRunClaimService(
 @Service
 class ImportRunCompletionService(
 	private val runRepository: ImportRunRepository,
-	private val draftRepository: ImportDraftRepository,
 	private val connectionRepository: ExternalConnectionRepository,
-	private val analyzer: RecruitmentMailAnalyzer,
-	private val jdbcTemplate: JdbcTemplate,
+	private val finalizationService: MailFinalizationService,
+	private val transactionTemplate: TransactionTemplate,
 	private val clock: Clock,
-	@Value("\${jobvis.import.retention:PT720H}") private val retention: Duration,
 ) {
-	@Transactional
 	fun complete(claim: ClaimedImportRun, collection: MailCollectionResult) {
 		val snapshot = runRepository.findById(claim.runId).orElse(null) ?: return
-		val connection = connectionRepository.findOwnedLocked(snapshot.connectionId, snapshot.userId)
-			?: run {
-				val run = runRepository.findClaimedLocked(claim.runId, claim.leaseOwner) ?: return
-				run.fail("CONNECTION_NOT_FOUND", Instant.now(clock))
-				runRepository.save(run)
-				return
-			}
-		val run = runRepository.findClaimedLocked(claim.runId, claim.leaseOwner) ?: return
-		if (run.status != ImportRunStatus.RUNNING) return
 		val now = Instant.now(clock)
-		if (connection.status != ConnectionStatus.CONNECTED) {
-			run.cancel("CONNECTION_NOT_CONNECTED", now)
-			runRepository.save(run)
-			return
-		}
-		if (connection.version != collection.connectionVersion) {
-			run.cancel("CONNECTION_CHANGED", now)
-			runRepository.save(run)
-			return
-		}
-		if (run.requestedBy == ImportRequestedBy.MONITOR && !connection.ongoingSyncConsent) {
-			run.cancel("MONITORING_CONSENT_REVOKED", now)
-			runRepository.save(run)
-			return
-		}
-		val seenMessageIds = mutableSetOf<String>()
+		var finalizedCount = 0
+		var ignoredCount = 0
 		var duplicateCount = 0
-		val drafts = collection.candidates.mapNotNull { candidate ->
-			val analysis = analyzer.analyze(candidate) ?: return@mapNotNull null
-			val messageId = candidate.providerMessageId.take(255)
-			if (!seenMessageIds.add(messageId) || !reserveMessage(run, messageId, now)) {
-				duplicateCount++
-				return@mapNotNull null
+		try {
+			collection.candidates.forEach { candidate ->
+				when (finalizationService.finalize(
+					claim, snapshot, candidate, collection.connectionVersion, now,
+				)) {
+					MailFinalizationOutcome.FINALIZED -> finalizedCount++
+					MailFinalizationOutcome.IGNORED -> ignoredCount++
+					MailFinalizationOutcome.DUPLICATE -> duplicateCount++
+				}
 			}
-			ImportDraft.pending(
-				UUID.randomUUID(), run.userId, run.id, run.connectionId,
-				candidate.copy(providerMessageId = messageId), analysis, now, now.plus(retention),
-			)
+		} catch (exception: MailFinalizationCancelledException) {
+			cancelInTransaction(claim, exception.errorCode, now)
+			return
 		}
-		draftRepository.saveAll(drafts)
-		draftRepository.flush()
-		run.complete(collection.candidates.size, drafts.size, duplicateCount, now)
-		val rangeCheckpoint = run.dateTo.plusDays(1).atStartOfDay(BusinessTime.SEOUL).toInstant()
-		connection.markSynced(minOf(now, rangeCheckpoint), now.plusSeconds(15 * 60), now)
-		runRepository.save(run)
-		connectionRepository.save(connection)
+		check(collection.candidates.size == finalizedCount + ignoredCount + duplicateCount) {
+			"가져오기 실행의 메시지 회계가 일치하지 않습니다."
+		}
+		transactionTemplate.executeWithoutResult {
+			val connection = connectionRepository.findOwnedLocked(snapshot.connectionId, snapshot.userId)
+				?: run {
+					val missingRun = runRepository.findClaimedLocked(claim.runId, claim.leaseOwner)
+					missingRun?.fail("CONNECTION_NOT_FOUND", now)
+					if (missingRun != null) runRepository.save(missingRun)
+					return@executeWithoutResult
+				}
+			val run = runRepository.findClaimedLocked(claim.runId, claim.leaseOwner)
+				?: return@executeWithoutResult
+			if (run.status != ImportRunStatus.RUNNING) return@executeWithoutResult
+			if (connection.status != ConnectionStatus.CONNECTED) {
+				run.cancel("CONNECTION_NOT_CONNECTED", now)
+				runRepository.save(run)
+				return@executeWithoutResult
+			}
+			if (connection.version != collection.connectionVersion) {
+				run.cancel("CONNECTION_CHANGED", now)
+				runRepository.save(run)
+				return@executeWithoutResult
+			}
+			if (run.requestedBy == ImportRequestedBy.MONITOR && !connection.ongoingSyncConsent) {
+				run.cancel("MONITORING_CONSENT_REVOKED", now)
+				runRepository.save(run)
+				return@executeWithoutResult
+			}
+			run.complete(collection.candidates.size, finalizedCount, duplicateCount, now)
+			val rangeCheckpoint = run.dateTo.plusDays(1).atStartOfDay(BusinessTime.SEOUL).toInstant()
+			connection.markSynced(minOf(now, rangeCheckpoint), now.plusSeconds(15 * 60), now)
+			runRepository.save(run)
+			connectionRepository.save(connection)
+		}
 	}
-
-	private fun reserveMessage(run: ImportRun, messageId: String, now: Instant): Boolean =
-		jdbcTemplate.update(
-			"""
-				INSERT INTO mail_ingestion_ledger (
-				    id, user_id, connection_id, provider_message_id, state, first_seen_at, updated_at
-				) VALUES (?, ?, ?, ?, 'DRAFTED', ?, ?)
-				ON CONFLICT (user_id, connection_id, provider_message_id) DO NOTHING
-			""".trimIndent(),
-			UUID.randomUUID(), run.userId, run.connectionId, messageId,
-			Timestamp.from(now), Timestamp.from(now),
-		) == 1
 
 	@Transactional
 	fun fail(
@@ -410,12 +414,18 @@ class ImportRunCompletionService(
 		runRepository.save(run)
 	}
 
-	@Transactional
 	fun cancel(claim: ClaimedImportRun, errorCode: String) {
-		val run = runRepository.findClaimedLocked(claim.runId, claim.leaseOwner) ?: return
-		if (run.status != ImportRunStatus.RUNNING) return
-		run.cancel(errorCode, Instant.now(clock))
-		runRepository.save(run)
+		cancelInTransaction(claim, errorCode, Instant.now(clock))
+	}
+
+	private fun cancelInTransaction(claim: ClaimedImportRun, errorCode: String, now: Instant) {
+		transactionTemplate.executeWithoutResult {
+			val run = runRepository.findClaimedLocked(claim.runId, claim.leaseOwner)
+				?: return@executeWithoutResult
+			if (run.status != ImportRunStatus.RUNNING) return@executeWithoutResult
+			run.cancel(errorCode, now)
+			runRepository.save(run)
+		}
 	}
 }
 
@@ -433,6 +443,12 @@ class ImportRetentionWorker(
 				DELETE FROM import_runs
 				WHERE purge_after <= ?
 				  AND status IN ('COMPLETED', 'FAILED', 'CANCELLED')
+				  AND NOT EXISTS (
+				      SELECT 1 FROM import_drafts draft
+				      WHERE draft.user_id = import_runs.user_id
+				        AND draft.run_id = import_runs.id
+				        AND draft.status = 'PENDING'
+				  )
 			""".trimIndent(),
 			Timestamp.from(now),
 		)

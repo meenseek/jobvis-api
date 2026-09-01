@@ -7,6 +7,7 @@ import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 import org.springframework.transaction.annotation.Isolation
 import org.springframework.data.domain.PageRequest
+import org.springframework.jdbc.core.JdbcTemplate
 import java.time.Clock
 import java.time.Instant
 import java.time.LocalDate
@@ -23,19 +24,12 @@ class ApplicationService(
 	private val activityRepository: ApplicationActivityRepository,
 	private val changeRepository: ApplicationChangeRepository,
 	private val mutationRepository: ApplicationMutationRepository,
+	private val reviewStateService: ApplicationReviewStateService,
+	private val jdbcTemplate: JdbcTemplate,
 	private val assembler: ApplicationAssembler,
 	private val objectMapper: ObjectMapper,
 	private val clock: Clock,
 ) {
-	@Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
-	fun list(userId: UUID, query: String?, status: String?): LegacyApplicationListResult {
-		val normalizedQuery = query.orEmpty().trim().lowercase(Locale.ROOT)
-		val normalizedStatus = normalizeStatus(status)
-		val slice = applicationRepository
-			.findListItems(userId, normalizedQuery, normalizedStatus, PageRequest.of(0, LEGACY_LIST_LIMIT))
-		return LegacyApplicationListResult(assembler.assembleListItems(userId, slice.content), slice.hasNext())
-	}
-
 	@Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
 	fun listPage(
 		userId: UUID,
@@ -50,13 +44,22 @@ class ApplicationService(
 		val slice = applicationRepository.findListItems(
 			userId, normalizedQuery, normalizedStatus, PageRequest.of(page, limit),
 		)
+		val totalCount = applicationRepository.countForUser(userId)
 		return ApplicationListPageResponse(
 			items = assembler.assembleListItems(userId, slice.content),
 			page = page,
 			limit = limit,
 			hasNext = slice.hasNext(),
+			filteredCount = applicationRepository.countListItems(userId, normalizedQuery, normalizedStatus),
+			totalCount = totalCount,
+			needsReviewCount = applicationRepository.countNeedsReview(userId),
+			reviewRevision = applicationRepository.reviewRevision(userId) ?: 0,
 		)
 	}
+
+	@Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+	fun counts(userId: UUID): ApplicationCountsResponse =
+		ApplicationCountsResponse(applicationRepository.countForUser(userId))
 
 	@Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
 	fun get(userId: UUID, applicationId: UUID): ApplicationResponse =
@@ -98,7 +101,11 @@ class ApplicationService(
 	fun create(userId: UUID, request: CreateRequest): ApplicationResponse {
 		val company = request.company.requiredTrimmed("회사명을 입력해 주세요.")
 		val position = request.position.requiredTrimmed("포지션을 입력해 주세요.")
-		val stage = ApplicationStage.fromApiValue(request.stage)
+		val normalizedStatus = request.status.trim().lowercase(Locale.ROOT)
+		if (normalizedStatus !in CREATE_STATUSES) {
+			throw BadRequestException("초기 지원 상태가 올바르지 않습니다.")
+		}
+		val stage = ApplicationStage.fromApiValue(normalizedStatus)
 		val operation = "CREATE"
 		val fingerprint = RequestFingerprint.of(operation, company, position, stage)
 		val now = Instant.now(clock)
@@ -119,7 +126,6 @@ class ApplicationService(
 			now = now,
 		)
 		applicationRepository.saveAndFlush(application)
-		scheduleRepository.save(ApplicationSchedule.createDefault(UUID.randomUUID(), userId, applicationId, now))
 		activityRepository.save(
 			ApplicationActivity.create(
 				id = UUID.randomUUID(),
@@ -140,6 +146,7 @@ class ApplicationService(
 		val position = request.position.requiredTrimmed("포지션을 입력해 주세요.")
 		val location = request.location.defaultIfBlank("근무지 미입력")
 		val employmentType = request.employmentType.defaultIfBlank("고용 형태 미입력")
+		val appliedAt = request.appliedAt
 		val operation = "UPDATE_DETAILS"
 		val fingerprint = RequestFingerprint.of(
 			operation,
@@ -148,6 +155,7 @@ class ApplicationService(
 			position,
 			location,
 			employmentType,
+			appliedAt,
 		)
 		val now = Instant.now(clock)
 		val mutation = reserveMutation(userId, request.mutationId, operation, fingerprint, now)
@@ -175,8 +183,18 @@ class ApplicationService(
 			employmentType,
 			now,
 		)
+		changed = changed or saveChangeIfDifferent(
+			userId,
+			applicationId,
+			request.mutationId,
+			"appliedAt",
+			"지원일",
+			application.appliedAt.toString(),
+			appliedAt.toString(),
+			now,
+		)
 		if (changed) {
-			application.updateDetails(company, position, location, employmentType, now)
+			application.updateDetails(company, position, location, employmentType, appliedAt, now)
 			application.markMutation(request.mutationId, now)
 			applicationRepository.saveAndFlush(application)
 		}
@@ -225,7 +243,6 @@ class ApplicationService(
 		verifyVersion(application, request.expectedVersion)
 		val previousStatus = application.currentStatusValue()
 		val previousLabel = application.currentStatusLabel()
-		val neededReview = application.needsReview
 		if (previousStatus != nextStatus) {
 			applyStatusTransition(application, nextStatus, now)
 			application.markMutation(request.mutationId, now)
@@ -248,15 +265,116 @@ class ApplicationService(
 					"status", "진행 상태", previousLabel, nextLabel, now,
 				),
 			)
-			if (neededReview) {
-				changeRepository.save(
-					ApplicationChange.create(
-						UUID.randomUUID(), userId, applicationId, request.mutationId,
-						"needsReview", "검토 상태", "확인 필요", "확인 완료", now,
-					),
-				)
-			}
 		}
+		return completeMutation(userId, mutation, application, now)
+	}
+
+	@Transactional
+	fun patchSchedule(
+		userId: UUID,
+		applicationId: UUID,
+		request: PatchScheduleRequest,
+	): ApplicationResponse {
+		val title = request.nextActionTitle?.trim()
+		val operation = "PATCH_SCHEDULE"
+		val fingerprint = RequestFingerprint.of(
+			operation,
+			applicationId,
+			request.expectedVersion,
+			request.nextActionAtPresent,
+			request.nextActionAt?.toString().orEmpty(),
+			request.nextActionTitlePresent,
+			title.orEmpty(),
+		)
+		val now = Instant.now(clock)
+		val mutation = reserveMutation(userId, request.mutationId, operation, fingerprint, now)
+		replayIfCompleted(userId, applicationId, mutation)?.let { return it }
+
+		val application = findOwnedApplicationLocked(userId, applicationId)
+		verifyVersion(application, request.expectedVersion)
+		val schedule = scheduleRepository.findForApplicationLocked(userId, applicationId)
+		if (schedule == null) {
+			val date = request.nextActionAt
+				?: throw BadRequestException("새 일정에는 날짜를 입력해 주세요.")
+			val type = defaultScheduleType(application.currentStatusValue())
+			val action = title?.takeIf(String::isNotBlank) ?: defaultScheduleAction(type)
+			val created = ApplicationSchedule.createFromDateView(
+				UUID.randomUUID(), userId, applicationId, type, action, date, now,
+			)
+			application.markMutation(request.mutationId, now)
+			applicationRepository.saveAndFlush(application)
+			scheduleRepository.saveAndFlush(created)
+			activityRepository.save(
+				ApplicationActivity.create(
+					UUID.randomUUID(), userId, applicationId, ActivityType.TASK,
+					"일정을 등록했습니다", "다음 지원 일정을 등록했습니다.", now,
+				),
+			)
+			return completeMutation(userId, mutation, application, now)
+		}
+		val previous = ScheduleValues.from(schedule)
+		val currentViewDate = schedule.scheduledAt?.let { LocalDate.ofInstant(it, SEOUL) }
+		val dateChangedInView = request.nextActionAtPresent && request.nextActionAt != currentViewDate
+		if (dateChangedInView && !schedule.allDay && schedule.timezone != SEOUL.id) {
+			throw BadRequestException("서울 시간대가 아닌 일정은 현재 화면에서 날짜를 변경할 수 없습니다.")
+		}
+		val changed = try {
+			schedule.updateFromDateView(
+				dateChangedInView,
+				request.nextActionAt,
+				request.nextActionTitlePresent,
+				title,
+				now,
+			)
+		} catch (exception: IllegalArgumentException) {
+			throw BadRequestException(exception.message ?: "일정 값을 확인해 주세요.")
+		}
+		if (changed) {
+			saveScheduleChanges(userId, applicationId, request.mutationId, previous, schedule, now)
+			application.markMutation(request.mutationId, now)
+			applicationRepository.saveAndFlush(application)
+			scheduleRepository.saveAndFlush(schedule)
+			activityRepository.save(
+				ApplicationActivity.create(
+					id = UUID.randomUUID(),
+					userId = userId,
+					applicationId = applicationId,
+					activityType = ActivityType.TASK,
+					title = "일정을 수정했습니다",
+					description = "다음 지원 일정을 업데이트했습니다.",
+					occurredAt = now,
+				),
+			)
+		}
+		return completeMutation(userId, mutation, application, now)
+	}
+
+	@Transactional
+	fun deleteActivity(
+		userId: UUID,
+		applicationId: UUID,
+		activityId: UUID,
+		request: MutationRequest,
+	): ApplicationResponse {
+		val operation = "DELETE_ACTIVITY"
+		val fingerprint = RequestFingerprint.of(operation, applicationId, activityId, request.expectedVersion)
+		val now = Instant.now(clock)
+		val mutation = reserveMutation(userId, request.mutationId, operation, fingerprint, now)
+		replayIfCompleted(userId, applicationId, mutation)?.let { return it }
+
+		val application = findOwnedApplicationLocked(userId, applicationId)
+		verifyVersion(application, request.expectedVersion)
+		val activity = activityRepository.findByIdAndUserIdAndApplicationId(activityId, userId, applicationId)
+			?: throw NotFoundException("지원 활동을 찾을 수 없습니다.")
+		activityRepository.delete(activity)
+		changeRepository.save(
+			ApplicationChange.create(
+				UUID.randomUUID(), userId, applicationId, request.mutationId,
+				"activity", "진행 타임라인", activity.title, "삭제됨", now,
+			),
+		)
+		application.markMutation(request.mutationId, now)
+		applicationRepository.saveAndFlush(application)
 		return completeMutation(userId, mutation, application, now)
 	}
 
@@ -319,7 +437,8 @@ class ApplicationService(
 		val description = request.description.trim()
 		val operation = "UPDATE_SCHEDULE"
 		val fingerprint = RequestFingerprint.of(
-			operation, applicationId, request.expectedVersion, request.expectedScheduleVersion, type, action,
+			operation, applicationId, request.expectedVersion,
+			request.expectedScheduleVersion?.toString().orEmpty(), type, action,
 			request.scheduledAt, request.endsAt?.toString().orEmpty(), timezone, location, description,
 		)
 		val now = Instant.now(clock)
@@ -332,13 +451,19 @@ class ApplicationService(
 		val application = applicationRepository.findOwnedLocked(applicationId, userId)
 			?: throw NotFoundException("지원 정보를 찾을 수 없습니다.")
 		verifyVersion(application, request.expectedVersion)
-		val schedule = scheduleRepository.findForApplicationLocked(userId, applicationId)
-			?: throw NotFoundException("지원 일정 정보를 찾을 수 없습니다.")
-		if (schedule.version != request.expectedScheduleVersion) {
+		val existingSchedule = scheduleRepository.findForApplicationLocked(userId, applicationId)
+		if (existingSchedule == null && request.expectedScheduleVersion != null) {
 			throw ConflictException("일정이 다른 곳에서 변경되었습니다. 최신 내용을 확인해 주세요.")
 		}
+		if (existingSchedule != null && existingSchedule.version != request.expectedScheduleVersion) {
+			throw ConflictException("일정이 다른 곳에서 변경되었습니다. 최신 내용을 확인해 주세요.")
+		}
+		val schedule = existingSchedule ?: ApplicationSchedule.createTimed(
+			UUID.randomUUID(), userId, applicationId, type, action, request.scheduledAt,
+			request.endsAt, timezone, location, description, now,
+		)
 		val previous = ScheduleValues.from(schedule)
-		val changed = schedule.update(
+		val changed = existingSchedule == null || schedule.update(
 			type, action, request.scheduledAt, request.endsAt, timezone, location, description, now,
 		)
 		if (changed) {
@@ -362,12 +487,14 @@ class ApplicationService(
 		val mutation = reserveMutation(userId, request.mutationId, operation, fingerprint, now)
 		replayIfCompleted(userId, applicationId, mutation)?.let { return it }
 
+		reviewStateService.lock(userId, now)
 		val application = findOwnedApplicationLocked(userId, applicationId)
 		verifyVersion(application, request.expectedVersion)
 		if (application.needsReview) {
 			application.completeReview(now)
 			application.markMutation(request.mutationId, now)
 			applicationRepository.saveAndFlush(application)
+			reviewStateService.increment(userId, now)
 			changeRepository.save(
 				ApplicationChange.create(
 					UUID.randomUUID(), userId, applicationId, request.mutationId,
@@ -376,6 +503,67 @@ class ApplicationService(
 			)
 		}
 		return completeMutation(userId, mutation, application, now)
+	}
+
+	@Transactional
+	fun completeBulkReview(userId: UUID, request: CompleteBulkReviewRequest): CompleteBulkReviewResponse {
+		val now = Instant.now(clock)
+		val currentRevision = reviewStateService.lock(userId, now)
+		val replay = jdbcTemplate.query(
+			"""
+				SELECT expected_review_revision, completed_count, needs_review_count,
+				       resulting_review_revision
+				FROM application_bulk_review_mutations
+				WHERE user_id = ? AND mutation_id = ?
+				FOR UPDATE
+			""".trimIndent(),
+			{ resultSet, _ ->
+				BulkReviewRecord(
+					resultSet.getLong("expected_review_revision"),
+					resultSet.getInt("completed_count"),
+					resultSet.getLong("needs_review_count"),
+					resultSet.getLong("resulting_review_revision"),
+				)
+			},
+			userId, request.mutationId,
+		).singleOrNull()
+		if (replay != null) {
+			if (replay.expectedRevision != request.expectedReviewRevision) throw mutationConflict()
+			return CompleteBulkReviewResponse(replay.completedCount, replay.needsReviewCount, replay.resultRevision)
+		}
+		if (currentRevision != request.expectedReviewRevision) {
+			throw ConflictException("확인 필요 목록이 변경되었습니다. 최신 목록을 확인해 주세요.")
+		}
+		val applications = applicationRepository.findNeedsReviewLocked(userId)
+		applications.forEach { application ->
+			application.completeReview(now)
+			application.markMutation(request.mutationId, now)
+			changeRepository.save(
+				ApplicationChange.create(
+					UUID.randomUUID(), userId, application.id, request.mutationId,
+					"needsReview", "검토 상태", "확인 필요", "확인 완료", now,
+				),
+			)
+		}
+		applicationRepository.saveAll(applications)
+		applicationRepository.flush()
+		val resultingRevision = if (applications.isEmpty()) {
+			currentRevision
+		} else {
+			reviewStateService.increment(userId, now)
+		}
+		val needsReviewCount = applicationRepository.countNeedsReview(userId)
+		jdbcTemplate.update(
+			"""
+				INSERT INTO application_bulk_review_mutations (
+				    id, user_id, mutation_id, expected_review_revision, completed_count,
+				    needs_review_count, resulting_review_revision, created_at
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			""".trimIndent(),
+			UUID.randomUUID(), userId, request.mutationId, request.expectedReviewRevision,
+			applications.size, needsReviewCount, resultingRevision, java.sql.Timestamp.from(now),
+		)
+		return CompleteBulkReviewResponse(applications.size, needsReviewCount, resultingRevision)
 	}
 
 	private fun reserveMutation(
@@ -462,9 +650,11 @@ class ApplicationService(
 		listOf(
 			ScheduleChange("scheduleType", "일정 종류", before.type, after.scheduleType.apiValue()),
 			ScheduleChange("scheduleAction", "일정 할 일", before.action, after.action),
+			ScheduleChange("scheduleAllDay", "종일 일정", before.allDay, if (after.allDay) "예" else "아니요"),
+			ScheduleChange("scheduledDate", "일정 날짜", before.date, after.scheduledDate?.toString().orEmpty()),
 			ScheduleChange("scheduledAt", "일정 시작", before.startsAt, after.scheduledAt?.toString().orEmpty()),
 			ScheduleChange("scheduleEndsAt", "일정 종료", before.endsAt, after.endsAt?.toString().orEmpty()),
-			ScheduleChange("scheduleTimezone", "일정 시간대", before.timezone, after.timezone),
+			ScheduleChange("scheduleTimezone", "일정 시간대", before.timezone, after.timezone.orEmpty()),
 			ScheduleChange("scheduleLocation", "일정 장소", before.location, after.location),
 			ScheduleChange("scheduleDescription", "일정 설명", before.description, after.description),
 			ScheduleChange("scheduleCompleted", "일정 상태", before.completed, if (after.completed) "완료" else "미완료"),
@@ -482,6 +672,21 @@ class ApplicationService(
 			"rejected" -> application.transitionToRejected(now)
 			else -> application.transitionToStage(ApplicationStage.fromApiValue(nextStatus), now)
 		}
+	}
+
+	private fun defaultScheduleType(status: String): ScheduleType = when (status) {
+		"applied", "screening" -> ScheduleType.APPLICATION
+		"test" -> ScheduleType.TEST
+		"interview" -> ScheduleType.INTERVIEW
+		else -> ScheduleType.FOLLOWUP
+	}
+
+	private fun defaultScheduleAction(type: ScheduleType): String = when (type) {
+		ScheduleType.APPLICATION -> "지원 일정"
+		ScheduleType.TEST -> "테스트 일정"
+		ScheduleType.INTERVIEW -> "면접 일정"
+		ScheduleType.FOLLOWUP -> "후속 일정"
+		ScheduleType.OTHER -> "지원 일정"
 	}
 
 	private fun findOwnedApplication(userId: UUID, applicationId: UUID): JobApplication =
@@ -502,12 +707,12 @@ class ApplicationService(
 
 	private fun normalizeStatus(status: String?): String {
 		val normalized = status?.takeUnless(String::isBlank)?.trim()?.lowercase(Locale.ROOT) ?: "all"
-		if (normalized !in FILTERS) throw BadRequestException("지원 상태 필터가 올바르지 않습니다.")
+		if (normalized !in LIST_FILTERS) throw BadRequestException("지원 상태 필터가 올바르지 않습니다.")
 		return normalized
 	}
 
-	private fun normalizeCommandStatus(status: String): String = normalizeStatus(status).also {
-		if (it == "all" || it == "review") throw BadRequestException("변경할 지원 상태가 올바르지 않습니다.")
+	private fun normalizeCommandStatus(status: String): String = status.trim().lowercase(Locale.ROOT).also {
+		if (it !in COMMAND_STATUSES) throw BadRequestException("변경할 지원 상태가 올바르지 않습니다.")
 	}
 
 	private fun String.requiredTrimmed(message: String): String =
@@ -528,9 +733,18 @@ class ApplicationService(
 		val after: String,
 	)
 
+	private data class BulkReviewRecord(
+		val expectedRevision: Long,
+		val completedCount: Int,
+		val needsReviewCount: Long,
+		val resultRevision: Long,
+	)
+
 	private data class ScheduleValues(
 		val type: String,
 		val action: String,
+		val allDay: String,
+		val date: String,
 		val startsAt: String,
 		val endsAt: String,
 		val timezone: String,
@@ -540,26 +754,26 @@ class ApplicationService(
 	) {
 		companion object {
 			fun from(schedule: ApplicationSchedule): ScheduleValues = ScheduleValues(
-				schedule.scheduleType.apiValue(), schedule.action, schedule.scheduledAt?.toString().orEmpty(),
-				schedule.endsAt?.toString().orEmpty(), schedule.timezone, schedule.location,
+				schedule.scheduleType.apiValue(), schedule.action, if (schedule.allDay) "예" else "아니요",
+				schedule.scheduledDate?.toString().orEmpty(), schedule.scheduledAt?.toString().orEmpty(),
+				schedule.endsAt?.toString().orEmpty(), schedule.timezone.orEmpty(), schedule.location,
 				schedule.description, if (schedule.completed) "완료" else "미완료",
 			)
 		}
 	}
 
 	companion object {
-		private const val LEGACY_LIST_LIMIT = 200
 		private val SEOUL: ZoneId = ZoneId.of("Asia/Seoul")
-		private val FILTERS = setOf(
-			"all", "review", "applied", "screening", "interview", "offer", "offered", "rejected",
+		private val LIST_FILTERS = setOf(
+			"all", "review", "application", "test", "interview", "offer", "offered", "rejected", "schedulable",
+		)
+		private val CREATE_STATUSES = setOf("applied", "screening", "test", "interview", "offer")
+		private val COMMAND_STATUSES = setOf(
+			"applied", "screening", "test", "interview", "offer", "offered", "rejected",
 		)
 	}
 }
 
-data class LegacyApplicationListResult(
-	val items: List<ApplicationListItemResponse>,
-	val hasNext: Boolean,
-)
 
 internal fun ApplicationSchedule.toResponse(applicationVersion: Long): ApplicationScheduleResponse = ApplicationScheduleResponse(
 	id = id,
@@ -568,6 +782,8 @@ internal fun ApplicationSchedule.toResponse(applicationVersion: Long): Applicati
 	version = version,
 	scheduleType = scheduleType.apiValue(),
 	action = action,
+	allDay = allDay,
+	date = scheduledDate,
 	scheduledAt = scheduledAt,
 	endsAt = endsAt,
 	timezone = timezone,

@@ -31,6 +31,7 @@ import org.springframework.test.web.servlet.result.MockMvcResultMatchers.status
 import org.springframework.jdbc.core.JdbcTemplate
 import tools.jackson.databind.JsonNode
 import tools.jackson.databind.ObjectMapper
+import java.sql.Timestamp
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -132,8 +133,10 @@ class ScheduleCalendarApiIntegrationTests @Autowired constructor(
 		mockMvc.perform(get("/api/v1/applications/{id}", applicationId).header(USER_HEADER, userId))
 			.andExpect(status().isOk)
 			.andExpect(jsonPath("$.version").value(1))
-			.andExpect(jsonPath("$.changes[?(@.title == '일정 종류')]").exists())
-			.andExpect(jsonPath("$.changes[?(@.title == '일정 장소')]").exists())
+		mockMvc.perform(get("/api/v1/applications/{id}/changes", applicationId).header(USER_HEADER, userId))
+			.andExpect(status().isOk)
+			.andExpect(jsonPath("$.items[?(@.title == '일정 종류')]").exists())
+			.andExpect(jsonPath("$.items[?(@.title == '일정 장소')]").exists())
 
 		val connection = connectionService.upsertOAuth(
 			userId,
@@ -420,12 +423,31 @@ class ScheduleCalendarApiIntegrationTests @Autowired constructor(
 							"mutationId" to UUID.randomUUID(),
 							"company" to "테스트 회사",
 							"position" to "백엔드 엔지니어",
-							"stage" to "applied",
+							"status" to "applied",
 						),
 					),
 				),
 		).andExpect(status().isCreated).andReturn().response.contentAsString
-		return json(response)
+		val application = json(response)
+		jdbcTemplate.update(
+			"""
+				INSERT INTO application_schedules (
+				    id, user_id, application_id, schedule_type, action,
+				    all_day, scheduled_date, scheduled_at, ends_at, timezone,
+				    location, description, last_import_received_at, manually_edited,
+				    completed, completed_at, version, created_at, updated_at
+				) VALUES (?, ?, ?, 'OTHER', '후속 일정', false, NULL, ?, ?, 'Asia/Seoul',
+				          '', '', NULL, true, false, NULL, 0, ?, ?)
+			""".trimIndent(),
+			UUID.randomUUID(),
+			userId,
+			UUID.fromString(application.path("id").asString()),
+			Timestamp.from(Instant.parse("2026-08-19T05:00:00Z")),
+			Timestamp.from(Instant.parse("2026-08-19T06:00:00Z")),
+			Timestamp.from(NOW),
+			Timestamp.from(NOW),
+		)
+		return application
 	}
 
 	private fun json(value: String): JsonNode = objectMapper.readTree(value)

@@ -9,8 +9,9 @@ enum class ApplicationStage(
 ) {
 	APPLIED("지원 완료", 0),
 	SCREENING("서류 검토", 1),
-	INTERVIEW("면접 진행", 2),
-	OFFER("처우 협의", 3),
+	TEST("과제·테스트", 2),
+	INTERVIEW("면접 진행", 3),
+	OFFER("처우 협의", 4),
 	;
 
 	fun highest(other: ApplicationStage): ApplicationStage = if (rank >= other.rank) this else other
@@ -38,6 +39,22 @@ enum class ApplicationResult {
 		fun fromApiValue(value: String): ApplicationResult =
 			runCatching { valueOf(value.trim().uppercase(Locale.ROOT)) }
 				.getOrElse { throw BadRequestException("지원 결과가 올바르지 않습니다.") }
+	}
+}
+
+enum class ApplicationSourceType {
+	MANUAL,
+	GMAIL,
+	OUTLOOK,
+	NAVER,
+	OTHER,
+	;
+
+	fun apiValue(): String = name.lowercase(Locale.ROOT)
+
+	companion object {
+		fun fromProviderValue(value: String): ApplicationSourceType =
+			entries.firstOrNull { it.name.equals(value, ignoreCase = true) } ?: OTHER
 	}
 }
 

@@ -26,7 +26,10 @@ class ImportRunWorkerHeartbeatTests {
 		val firstStarted = CountDownLatch(1)
 		val releaseFirst = CountDownLatch(1)
 		val secondRan = CountDownLatch(1)
-		val claimService = object : ImportRunClaimService(Mockito.mock(JdbcTemplate::class.java)) {
+		val claimService = object : ImportRunClaimService(
+			Mockito.mock(JdbcTemplate::class.java),
+			Mockito.mock(com.meenseek.jobvis.imports.MailImportRolloutGate::class.java),
+		) {
 			override fun heartbeat(claim: ClaimedImportRun): Boolean = when (claim) {
 				firstClaim -> {
 					firstStarted.countDown()

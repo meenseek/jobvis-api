@@ -1,5 +1,6 @@
 package com.meenseek.jobvis.connection
 
+import com.meenseek.jobvis.auth.UserAccountRepository
 import com.meenseek.jobvis.common.BadRequestException
 import com.meenseek.jobvis.common.ConflictException
 import com.meenseek.jobvis.common.NotFoundException
@@ -18,6 +19,7 @@ import java.util.UUID
 @Service
 class ConnectionService(
 	private val connectionRepository: ExternalConnectionRepository,
+	private val userAccountRepository: UserAccountRepository,
 	private val naverCredentialValidator: NaverCredentialValidator,
 	private val naverConnectionAttemptGuard: NaverConnectionAttemptGuard,
 	private val credentialCipher: CredentialCipher,
@@ -40,8 +42,18 @@ class ConnectionService(
 	}
 
 	@Transactional(readOnly = true)
-	fun list(userId: UUID): List<ExternalConnectionResponse> =
-		connectionRepository.findAllForUser(userId).map { connection -> connection.toResponse() }
+	fun list(userId: UUID, capabilityValue: String?, includeRevoked: Boolean): List<ExternalConnectionResponse> {
+		val capability = capabilityValue?.takeUnless(String::isBlank)?.trim()?.uppercase(Locale.ROOT)?.let { value ->
+			runCatching { ConnectionCapability.valueOf(value) }
+				.getOrElse { throw BadRequestException("연결 capability가 올바르지 않습니다.") }
+		}
+		return connectionRepository.findAllForUser(userId)
+			.asSequence()
+			.filter { capability == null || it.provider.capability == capability }
+			.filter { includeRevoked || it.status != ConnectionStatus.REVOKED }
+			.map { it.toResponse() }
+			.toList()
+	}
 
 	fun connectNaver(userId: UUID, request: ConnectNaverRequest): ExternalConnectionResponse {
 		if (!credentialCipher.available) {
@@ -54,7 +66,10 @@ class ConnectionService(
 		}
 		return transactionTemplate.execute {
 			val now = Instant.now(clock)
+			lockMailSlot(userId, ConnectionProvider.NAVER, email)
 			val existing = connectionRepository.findExistingLocked(userId, ConnectionProvider.NAVER, email)
+			val preserveMigrationBlock =
+				existing?.lastErrorCode == "NAVER_LEDGER_MIGRATION_REQUIRED"
 			val connectionId = existing?.id ?: UUID.randomUUID()
 			if (existing != null) cancelActiveRuns(userId, connectionId, "CONNECTION_RECONNECTED", now)
 			val encrypted = credentialCipher.encrypt(appPassword, appPasswordContext(connectionId))
@@ -63,6 +78,7 @@ class ConnectionService(
 			} ?: ExternalConnection.createAppPassword(
 				connectionId, userId, email, encrypted, request.ongoingSyncConsent, now,
 			)
+			if (preserveMigrationBlock) connection.preserveNaverLedgerMigrationBlock(now)
 			connectionRepository.saveAndFlush(connection).toResponse()
 		}
 	}
@@ -138,6 +154,7 @@ class ConnectionService(
 		}
 		val now = Instant.now(clock)
 		val email = tokens.accountEmail.trim().lowercase(Locale.ROOT)
+		lockMailSlot(userId, provider, email)
 		val existing = connectionRepository.findExistingLocked(userId, provider, email)
 		val connectionId = existing?.id ?: UUID.randomUUID()
 		if (existing != null) cancelActiveRuns(userId, connectionId, "CONNECTION_RECONNECTED", now)
@@ -187,6 +204,18 @@ class ConnectionService(
 	fun findOwned(userId: UUID, connectionId: UUID): ExternalConnection =
 		connectionRepository.findOwned(connectionId, userId)
 			?: throw NotFoundException("외부 연결을 찾을 수 없습니다.")
+
+	private fun lockMailSlot(userId: UUID, provider: ConnectionProvider, email: String) {
+		if (provider.capability != ConnectionCapability.MAIL) return
+		userAccountRepository.findLocked(userId)
+			?: throw NotFoundException("사용자 정보를 찾을 수 없습니다.")
+		val conflicting = connectionRepository.findActiveMailForUserLocked(userId).firstOrNull { connection ->
+			connection.provider != provider || !connection.accountEmail.equals(email, ignoreCase = true)
+		}
+		if (conflicting != null) {
+			throw ConflictException("기존 채용 메일 연결을 해제한 뒤 새 계정을 연결해 주세요.")
+		}
+	}
 
 	private fun cancelActiveRuns(userId: UUID, connectionId: UUID, errorCode: String, now: Instant) {
 		jdbcTemplate.update(

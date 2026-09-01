@@ -91,7 +91,9 @@ class ConnectionApiIntegrationTests @Autowired constructor(
 
 	@Test
 	fun `연결 기능 표시는 공급자 설정과 암호화 키 상태를 사실대로 반환한다`() {
-		mockMvc.perform(get("/api/v1/connections/capabilities"))
+		mockMvc.perform(
+			get("/api/v1/connections/capabilities").header(USER_HEADER, UUID.randomUUID()),
+		)
 			.andExpect(status().isOk)
 			.andExpect(jsonPath("$[0].provider").value("gmail"))
 			.andExpect(jsonPath("$[0].available").value(false))

@@ -1,6 +1,5 @@
 package com.meenseek.jobvis.application
 
-import com.meenseek.jobvis.common.NotFoundException
 import org.springframework.data.domain.PageRequest
 import org.springframework.stereotype.Component
 import java.time.LocalDate
@@ -20,68 +19,24 @@ class ApplicationAssembler(
 
 	fun assembleAt(userId: UUID, application: JobApplication, historyWatermark: Long): ApplicationResponse {
 		val schedule = scheduleRepository.findForApplication(userId, application.id)
-			?: throw NotFoundException("지원 일정 정보를 찾을 수 없습니다.")
-		val page = PageRequest.of(0, HISTORY_SUMMARY_LIMIT)
-		return toResponse(
-			application = application,
-			schedule = schedule,
-			emails = emailRepository
-					.findAllByUserIdAndApplicationIdAndRecordedOrderLessThanEqualOrderByRecordedOrderDesc(
-					userId, application.id, historyWatermark, page,
-				),
-			activities = activityRepository
-					.findAllByUserIdAndApplicationIdAndRecordedOrderLessThanEqualOrderByRecordedOrderDesc(
-					userId, application.id, historyWatermark, page,
-				),
-			changes = changeRepository
-					.findAllByUserIdAndApplicationIdAndRecordedOrderLessThanEqualOrderByRecordedOrderDesc(
-					userId, application.id, historyWatermark, page,
-				),
-		)
+		return toResponse(application, schedule)
 	}
 
 	fun restore(userId: UUID, snapshot: ApplicationResponse, historyWatermark: Long): ApplicationResponse =
-		snapshot.copy(
-			emails = emailRepository
-					.findAllByUserIdAndApplicationIdAndRecordedOrderLessThanEqualOrderByRecordedOrderDesc(
-					userId, snapshot.id, historyWatermark, PageRequest.of(0, HISTORY_SUMMARY_LIMIT),
-				).map(::toEmailResponse),
-			activities = activityRepository
-					.findAllByUserIdAndApplicationIdAndRecordedOrderLessThanEqualOrderByRecordedOrderDesc(
-					userId, snapshot.id, historyWatermark, PageRequest.of(0, HISTORY_SUMMARY_LIMIT),
-				).map(::toActivityResponse),
-			changes = changeRepository
-					.findAllByUserIdAndApplicationIdAndRecordedOrderLessThanEqualOrderByRecordedOrderDesc(
-					userId, snapshot.id, historyWatermark, PageRequest.of(0, HISTORY_SUMMARY_LIMIT),
-				).map(::toChangeResponse),
-		)
+		snapshot
 
 	fun assembleListItems(userId: UUID, applications: List<JobApplication>): List<ApplicationListItemResponse> {
 		if (applications.isEmpty()) return emptyList()
-		val applicationIds = applications.map(JobApplication::id)
-		val schedules = scheduleRepository.findAllForApplications(userId, applicationIds)
-			.associateBy(ApplicationSchedule::applicationId)
 		return applications.map { application ->
-			val schedule = schedules[application.id]
-				?: throw NotFoundException("지원 일정 정보를 찾을 수 없습니다.")
 			ApplicationListItemResponse(
 				id = application.id,
 				version = application.version,
 				company = application.company,
 				position = application.position,
-				location = application.location,
-				employmentType = application.employmentType,
 				appliedAt = application.appliedAt,
-				stage = application.stage.apiValue(),
-				highestStageReached = application.highestStageReached.apiValue(),
-				screeningPassed = application.screeningPassed,
-				result = application.result.apiValue(),
+				status = application.currentStatusValue(),
 				needsReview = application.needsReview,
 				source = application.source,
-				nextAction = schedule.action,
-				scheduleType = schedule.scheduleType.apiValue(),
-				nextActionAt = schedule.scheduledAt?.let { LocalDate.ofInstant(it, SEOUL) },
-				nextActionCompleted = schedule.completed,
 			)
 		}
 	}
@@ -90,7 +45,10 @@ class ApplicationAssembler(
 		val rows = emailRepository.findAllByUserIdAndApplicationIdAndRecordedOrderLessThanOrderByRecordedOrderDesc(
 			userId, applicationId, before, PageRequest.of(0, limit + 1),
 		)
-		return historyPage(rows, limit, ApplicationEmail::recordedOrder, ::toEmailResponse)
+		return historyPage(
+			rows, limit, ApplicationEmail::recordedOrder, ::toEmailResponse,
+			emailRepository.countByUserIdAndApplicationId(userId, applicationId),
+		)
 	}
 
 	fun activitiesPage(
@@ -102,14 +60,17 @@ class ApplicationAssembler(
 		val rows = activityRepository.findAllByUserIdAndApplicationIdAndRecordedOrderLessThanOrderByRecordedOrderDesc(
 			userId, applicationId, before, PageRequest.of(0, limit + 1),
 		)
-		return historyPage(rows, limit, ApplicationActivity::recordedOrder, ::toActivityResponse)
+		return historyPage(rows, limit, ApplicationActivity::recordedOrder, ::toActivityResponse, null)
 	}
 
 	fun changesPage(userId: UUID, applicationId: UUID, before: Long, limit: Int): HistoryPageResponse<ChangeResponse> {
 		val rows = changeRepository.findAllByUserIdAndApplicationIdAndRecordedOrderLessThanOrderByRecordedOrderDesc(
 			userId, applicationId, before, PageRequest.of(0, limit + 1),
 		)
-		return historyPage(rows, limit, ApplicationChange::recordedOrder, ::toChangeResponse)
+		return historyPage(
+			rows, limit, ApplicationChange::recordedOrder, ::toChangeResponse,
+			changeRepository.countByUserIdAndApplicationId(userId, applicationId),
+		)
 	}
 
 	private fun <T, R> historyPage(
@@ -117,20 +78,19 @@ class ApplicationAssembler(
 		limit: Int,
 		order: (T) -> Long,
 		mapper: (T) -> R,
+		totalCount: Long?,
 	): HistoryPageResponse<R> {
 		val visible = rows.take(limit)
 		return HistoryPageResponse(
 			items = visible.map(mapper),
 			nextCursor = if (rows.size > limit) visible.lastOrNull()?.let(order) else null,
+			totalCount = totalCount,
 		)
 	}
 
 	private fun toResponse(
 		application: JobApplication,
-		schedule: ApplicationSchedule,
-		emails: List<ApplicationEmail>,
-		activities: List<ApplicationActivity>,
-		changes: List<ApplicationChange>,
+		schedule: ApplicationSchedule?,
 	): ApplicationResponse = ApplicationResponse(
 		id = application.id,
 		version = application.version,
@@ -139,20 +99,20 @@ class ApplicationAssembler(
 		location = application.location,
 		employmentType = application.employmentType,
 		appliedAt = application.appliedAt,
-		stage = application.stage.apiValue(),
-		highestStageReached = application.highestStageReached.apiValue(),
-		screeningPassed = application.screeningPassed,
-		result = application.result.apiValue(),
+		status = application.currentStatusValue(),
 		needsReview = application.needsReview,
 		source = application.source,
-		nextAction = schedule.action,
-		scheduleType = schedule.scheduleType.apiValue(),
-		nextActionAt = schedule.scheduledAt?.let { LocalDate.ofInstant(it, SEOUL) },
-		nextActionCompleted = schedule.completed,
+		sourceType = application.sourceType.apiValue(),
+		schedule = schedule?.takeUnless { it.completed }?.let {
+			ApplicationScheduleSummaryResponse(
+				it.action,
+				requireNotNull(
+					it.scheduledDate
+						?: it.scheduledAt?.let { scheduledAt -> LocalDate.ofInstant(scheduledAt, SEOUL) },
+				) { "일정 날짜가 없습니다: ${it.id}" },
+			)
+		},
 		memo = application.memo,
-		emails = emails.map(::toEmailResponse),
-		activities = activities.map(::toActivityResponse),
-		changes = changes.map(::toChangeResponse),
 	)
 
 	private fun toEmailResponse(email: ApplicationEmail): EmailResponse =
@@ -167,6 +127,5 @@ class ApplicationAssembler(
 
 	companion object {
 		private val SEOUL: ZoneId = ZoneId.of("Asia/Seoul")
-		const val HISTORY_SUMMARY_LIMIT = 50
 	}
 }

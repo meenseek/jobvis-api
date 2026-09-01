@@ -55,6 +55,18 @@ interface ExternalConnectionRepository : JpaRepository<ExternalConnection, UUID>
 		@Param("accountEmail") accountEmail: String,
 	): ExternalConnection?
 
+	@Lock(LockModeType.PESSIMISTIC_WRITE)
+	@Query(
+		"SELECT connection FROM ExternalConnection connection " +
+			"WHERE connection.storedUserId = :userId " +
+			"AND connection.storedProvider IN (" +
+			"com.meenseek.jobvis.connection.ConnectionProvider.GMAIL, " +
+			"com.meenseek.jobvis.connection.ConnectionProvider.OUTLOOK, " +
+			"com.meenseek.jobvis.connection.ConnectionProvider.NAVER) " +
+			"AND connection.storedStatus <> com.meenseek.jobvis.connection.ConnectionStatus.REVOKED",
+	)
+	fun findActiveMailForUserLocked(@Param("userId") userId: UUID): List<ExternalConnection>
+
 	@Query(
 		"SELECT connection FROM ExternalConnection connection " +
 			"WHERE connection.storedStatus = com.meenseek.jobvis.connection.ConnectionStatus.CONNECTED " +

@@ -11,6 +11,7 @@ import org.springframework.web.bind.annotation.PathVariable
 import org.springframework.web.bind.annotation.PostMapping
 import org.springframework.web.bind.annotation.RequestBody
 import org.springframework.web.bind.annotation.RequestMapping
+import org.springframework.web.bind.annotation.RequestParam
 import org.springframework.web.bind.annotation.ResponseStatus
 import org.springframework.web.bind.annotation.RestController
 import java.util.UUID
@@ -23,11 +24,19 @@ class ConnectionController(
 	private val connectionOAuthService: ConnectionOAuthService,
 ) {
 	@GetMapping("/capabilities")
-	fun capabilities(): List<ConnectionCapabilityResponse> = connectionService.capabilities()
+	fun capabilities(httpRequest: HttpServletRequest): List<ConnectionCapabilityResponse> {
+		currentUserProvider.currentUserId(httpRequest)
+		return connectionService.capabilities()
+	}
 
 	@GetMapping
-	fun list(httpRequest: HttpServletRequest): List<ExternalConnectionResponse> =
-		connectionService.list(currentUserProvider.currentUserId(httpRequest))
+	fun list(
+		@RequestParam(required = false) capability: String?,
+		@RequestParam(required = false, defaultValue = "true") includeRevoked: Boolean,
+		httpRequest: HttpServletRequest,
+	): List<ExternalConnectionResponse> = connectionService.list(
+		currentUserProvider.currentUserId(httpRequest), capability, includeRevoked,
+	)
 
 	@PostMapping("/naver")
 	@ResponseStatus(HttpStatus.CREATED)

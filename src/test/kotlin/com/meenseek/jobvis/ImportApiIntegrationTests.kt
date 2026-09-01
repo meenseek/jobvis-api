@@ -17,6 +17,7 @@ import com.meenseek.jobvis.imports.CreateImportRunRequest
 import com.meenseek.jobvis.imports.MailFailureDisposition
 import com.meenseek.jobvis.common.ServiceUnavailableException
 import org.assertj.core.api.Assertions.assertThat
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.context.SpringBootTest
@@ -72,6 +73,11 @@ class ImportApiIntegrationTests @Autowired constructor(
 	private val runService: ImportRunService,
 	private val testMailCollector: TestMailCollector,
 ) : PostgresIntegrationTest() {
+	@BeforeEach
+	fun resetStoredTestState() {
+		jdbcTemplate.execute("TRUNCATE TABLE users CASCADE")
+	}
+
 	@Test
 	fun `scheduled dispatch는 외부 메일 수집 완료를 기다리지 않는다`() {
 		val userId = UUID.randomUUID()
@@ -109,8 +115,9 @@ class ImportApiIntegrationTests @Autowired constructor(
 						runCatching {
 							runService.create(
 								userId,
-								CreateImportRunRequest(
-									connectionId,
+							CreateImportRunRequest(
+								UUID.randomUUID(),
+								connectionId,
 									LocalDate.parse("2026-08-01"),
 									LocalDate.parse("2026-08-17"),
 								),
@@ -206,7 +213,7 @@ class ImportApiIntegrationTests @Autowired constructor(
 	}
 
 	@Test
-	fun `읽기 전용 가져오기는 초안을 만든 뒤 명시적 수락에서만 지원서와 일정 하나를 생성한다`() {
+	fun `읽기 전용 가져오기는 채용 메일을 지원과 일정으로 직접 확정한다`() {
 		val userId = UUID.randomUUID()
 		val connectionId = connectNaver(userId)
 		val run = createRun(userId, connectionId)
@@ -218,51 +225,26 @@ class ImportApiIntegrationTests @Autowired constructor(
 			.andExpect(status().isOk)
 			.andExpect(jsonPath("$.status").value("completed"))
 			.andExpect(jsonPath("$.scannedCount").value(2))
-			.andExpect(jsonPath("$.draftCount").value(1))
+			.andExpect(jsonPath("$.finalizedCount").value(1))
+			.andExpect(jsonPath("$.ignoredCount").value(1))
 			.andExpect(jsonPath("$.duplicateCount").value(0))
-
-		val drafts = json(
-			mockMvc.perform(
-				get("/api/v1/import-drafts").param("status", "pending").header(USER_HEADER, userId),
-			).andExpect(status().isOk)
-				.andExpect(jsonPath("$.items.length()").value(1))
-				.andExpect(jsonPath("$.items[0].provider").value("naver"))
-				.andExpect(jsonPath("$.items[0].scheduleType").value("interview"))
-				.andReturn().response.contentAsString,
-		)
-		val draft = drafts.path("items")[0]
-		val draftId = draft.path("id").asString()
-		assertThat(applicationCount(userId)).isZero()
+		assertThat(applicationCount(userId)).isEqualTo(1)
 		assertThat(storedRawMailColumns()).isEmpty()
 
-		val mutationId = UUID.randomUUID()
-		val decision = objectMapper.writeValueAsString(
-			mapOf("mutationId" to mutationId, "expectedVersion" to 0),
-		)
-		val accepted = mockMvc.perform(
-			post("/api/v1/import-drafts/{id}/accept", draftId)
-				.header(USER_HEADER, userId)
-				.contentType(MediaType.APPLICATION_JSON)
-				.content(decision),
-		).andExpect(status().isOk)
+		val applicationId = jdbcTemplate.queryForObject(
+			"SELECT id FROM applications WHERE user_id = ?", UUID::class.java, userId,
+		) ?: error("자동 확정된 지원이 없습니다.")
+		mockMvc.perform(get("/api/v1/applications/{id}", applicationId).header(USER_HEADER, userId))
+			.andExpect(status().isOk)
 			.andExpect(jsonPath("$.company").value("Acme"))
-			.andExpect(jsonPath("$.position").value("백엔드 엔지니어 면접 안내"))
+			.andExpect(jsonPath("$.needsReview").value(true))
+		mockMvc.perform(get("/api/v1/applications/{id}/emails", applicationId).header(USER_HEADER, userId))
+			.andExpect(status().isOk)
+			.andExpect(jsonPath("$.items.length()").value(1))
+		mockMvc.perform(get("/api/v1/applications/{id}/schedule", applicationId).header(USER_HEADER, userId))
+			.andExpect(status().isOk)
 			.andExpect(jsonPath("$.scheduleType").value("interview"))
-			.andExpect(jsonPath("$.nextAction").value("면접"))
-			.andExpect(jsonPath("$.nextActionAt").value("2026-08-20"))
-			.andExpect(jsonPath("$.emails.length()").value(1))
-			.andReturn().response.contentAsString
-
-		val applicationId = json(accepted).path("id").asString()
-		mockMvc.perform(
-			post("/api/v1/import-drafts/{id}/accept", draftId)
-				.header(USER_HEADER, userId)
-				.contentType(MediaType.APPLICATION_JSON)
-				.content(decision),
-		).andExpect(status().isOk)
-			.andExpect(jsonPath("$.id").value(applicationId))
-
-		assertThat(applicationCount(userId)).isEqualTo(1)
+			.andExpect(jsonPath("$.scheduledAt").value("2026-08-20T05:00:00Z"))
 		assertThat(
 			jdbcTemplate.queryForObject(
 				"SELECT count(*) FROM application_schedules WHERE user_id = ?",
@@ -271,12 +253,18 @@ class ImportApiIntegrationTests @Autowired constructor(
 			),
 		).isEqualTo(1)
 
-		mockMvc.perform(get("/api/v1/import-drafts/{id}", draftId).header(USER_HEADER, UUID.randomUUID()))
+		assertThat(
+			jdbcTemplate.queryForList(
+				"SELECT state FROM mail_ingestion_ledger WHERE user_id = ? ORDER BY state",
+				String::class.java, userId,
+			),
+		).containsExactly("FINALIZED", "IGNORED")
+		mockMvc.perform(get("/api/v1/import-drafts").header(USER_HEADER, userId))
 			.andExpect(status().isNotFound)
 	}
 
 	@Test
-	fun `같은 연결의 중복 실행은 거부하고 초안 제외는 멱등적이다`() {
+	fun `같은 연결의 활성 실행은 거부하고 공개 draft API는 존재하지 않는다`() {
 		val userId = UUID.randomUUID()
 		val connectionId = connectNaver(userId)
 		createRun(userId, connectionId)
@@ -288,25 +276,9 @@ class ImportApiIntegrationTests @Autowired constructor(
 		).andExpect(status().isConflict)
 
 		assertThat(worker.runOnce()).isTrue()
-		val draft = json(
-			mockMvc.perform(get("/api/v1/import-drafts").header(USER_HEADER, userId))
-				.andExpect(status().isOk)
-				.andReturn().response.contentAsString,
-			).path("items")[0]
-		val mutationId = UUID.randomUUID()
-		val decision = objectMapper.writeValueAsString(
-			mapOf("mutationId" to mutationId, "expectedVersion" to 0),
-		)
-		repeat(2) {
-			mockMvc.perform(
-				post("/api/v1/import-drafts/{id}/reject", draft.path("id").asString())
-					.header(USER_HEADER, userId)
-					.contentType(MediaType.APPLICATION_JSON)
-					.content(decision),
-			).andExpect(status().isOk)
-				.andExpect(jsonPath("$.status").value("rejected"))
-		}
-		assertThat(applicationCount(userId)).isZero()
+		assertThat(applicationCount(userId)).isEqualTo(1)
+		mockMvc.perform(post("/api/v1/import-drafts/{id}/reject", UUID.randomUUID()).header(USER_HEADER, userId))
+			.andExpect(status().isNotFound)
 	}
 
 	@Test
@@ -359,77 +331,31 @@ class ImportApiIntegrationTests @Autowired constructor(
 	}
 
 	@Test
-	fun `후속 채용 메일은 버전을 확인한 뒤 기존 지원과 단일 일정에 원자적으로 연결한다`() {
+	fun `같은 provider process의 후속 메일은 기존 지원과 단일 일정에 원자적으로 연결한다`() {
 		val userId = UUID.randomUUID()
 		val connectionId = connectNaver(userId)
-		val firstRun = createRun(userId, connectionId)
-		processRun(firstRun)
-		val firstDraft = pendingDraft(userId)
-		val created = acceptDraft(userId, firstDraft, mapOf())
-		val applicationId = created.path("id").asString()
-		val schedule = json(
-			mockMvc.perform(get("/api/v1/applications/{id}/schedule", applicationId).header(USER_HEADER, userId))
-				.andExpect(status().isOk)
-				.andReturn().response.contentAsString,
-		)
+		processRun(createRun(userId, connectionId))
+		val applicationId = jdbcTemplate.queryForObject(
+			"SELECT id FROM applications WHERE user_id = ?", UUID::class.java, userId,
+		) ?: error("자동 확정된 지원이 없습니다.")
 
-		val offerRun = createRun(userId, connectionId)
-		processRun(offerRun)
-		val followUp = pendingDraft(userId)
-		val staleBody = decisionBody(
-			followUp,
-			mapOf(
-				"targetApplicationId" to applicationId,
-				"expectedApplicationVersion" to 99,
-				"expectedScheduleVersion" to schedule.path("version").asLong(),
-			),
-		)
-		mockMvc.perform(
-			post("/api/v1/import-drafts/{id}/accept", followUp.path("id").asString())
-				.header(USER_HEADER, userId)
-				.contentType(MediaType.APPLICATION_JSON)
-				.content(staleBody),
-		).andExpect(status().isConflict)
+		processRun(createRun(userId, connectionId))
 
-		val acceptMutationId = UUID.randomUUID()
-		val accepted = acceptDraft(
-			userId,
-			followUp,
-			mapOf(
-				"mutationId" to acceptMutationId,
-				"targetApplicationId" to applicationId,
-				"expectedApplicationVersion" to created.path("version").asLong(),
-				"expectedScheduleVersion" to schedule.path("version").asLong(),
-			),
-		)
-		assertThat(accepted.path("id").asString()).isEqualTo(applicationId)
-		assertThat(accepted.path("result").asString()).isEqualTo("offered")
-		assertThat(accepted.path("emails").size()).isEqualTo(2)
-		assertThat(accepted.path("changes").any { it.path("title").asString() == "진행 상태" }).isTrue()
-		assertThat(accepted.path("changes").any { it.path("title").asString() == "현재 단계" }).isTrue()
-		assertThat(accepted.path("changes").any { it.path("title").asString() == "지원 결과" }).isTrue()
-		mockMvc.perform(
-			post("/api/v1/import-drafts/{id}/accept", followUp.path("id").asString())
-				.header(USER_HEADER, userId)
-				.contentType(MediaType.APPLICATION_JSON)
-				.content(
-					decisionBody(
-						followUp,
-						mapOf(
-							"mutationId" to acceptMutationId,
-							"expectedVersion" to 999,
-							"targetApplicationId" to applicationId,
-							"expectedApplicationVersion" to created.path("version").asLong(),
-							"expectedScheduleVersion" to schedule.path("version").asLong(),
-						),
-					),
-				),
-		).andExpect(status().isConflict)
 		assertThat(applicationCount(userId)).isEqualTo(1)
+		mockMvc.perform(get("/api/v1/applications/{id}", applicationId).header(USER_HEADER, userId))
+			.andExpect(status().isOk)
+			.andExpect(jsonPath("$.status").value("offered"))
+			.andExpect(jsonPath("$.needsReview").value(true))
+		mockMvc.perform(get("/api/v1/applications/{id}/emails", applicationId).header(USER_HEADER, userId))
+			.andExpect(status().isOk)
+			.andExpect(jsonPath("$.items.length()").value(2))
+		mockMvc.perform(get("/api/v1/applications/{id}/changes", applicationId).header(USER_HEADER, userId))
+			.andExpect(status().isOk)
+			.andExpect(jsonPath("$.items[0].title").value("진행 상태"))
 		assertThat(
 			jdbcTemplate.queryForObject(
 				"SELECT count(*) FROM application_schedules WHERE user_id = ? AND application_id = ?",
-				Long::class.java, userId, UUID.fromString(applicationId),
+				Long::class.java, userId, applicationId,
 			),
 		).isEqualTo(1)
 	}
@@ -491,7 +417,7 @@ class ImportApiIntegrationTests @Autowired constructor(
 	}
 
 	@Test
-	fun `수집 뒤 연결 세대가 바뀌면 늦은 결과와 초안을 저장하지 않는다`() {
+	fun `수집 뒤 연결 세대가 바뀌면 늦은 메시지를 확정하지 않는다`() {
 		val userId = UUID.randomUUID()
 		val connectionId = connectNaver(userId)
 		createRun(userId, connectionId)
@@ -519,7 +445,12 @@ class ImportApiIntegrationTests @Autowired constructor(
 		assertThat(stored["error_code"]).isEqualTo("CONNECTION_CHANGED")
 		assertThat(
 			jdbcTemplate.queryForObject(
-				"SELECT count(*) FROM import_drafts WHERE run_id = ?", Long::class.java, claim.runId,
+				"SELECT count(*) FROM applications WHERE user_id = ?", Long::class.java, userId,
+			),
+		).isZero()
+		assertThat(
+			jdbcTemplate.queryForObject(
+				"SELECT count(*) FROM mail_ingestion_ledger WHERE user_id = ?", Long::class.java, userId,
 			),
 		).isZero()
 	}
@@ -759,7 +690,12 @@ class ImportApiIntegrationTests @Autowired constructor(
 		val userId = UUID.randomUUID()
 		val connectionId = connectNaver(userId, ongoingSyncConsent = true)
 		val body = objectMapper.writeValueAsString(
-			mapOf("connectionId" to connectionId, "dateFrom" to "2021-01-01", "dateTo" to "2021-12-31"),
+			mapOf(
+				"mutationId" to UUID.randomUUID(),
+				"connectionId" to connectionId,
+				"dateFrom" to "2021-01-01",
+				"dateTo" to "2021-12-31",
+			),
 		)
 		mockMvc.perform(
 			post("/api/v1/import-runs").header(USER_HEADER, userId)
@@ -842,45 +778,41 @@ class ImportApiIntegrationTests @Autowired constructor(
 	}
 
 	@Test
-	fun `낮은 신뢰도의 최종 합격 메일도 검토 필요 상태로 저장할 수 있다`() {
+	fun `자동 확정된 최종 합격 메일은 검토 필요 상태로 저장된다`() {
 		val userId = UUID.randomUUID()
 		val connectionId = connectNaver(userId)
 		testMailCollector.useLowConfidenceOffer(connectionId)
-		val run = createRun(userId, connectionId)
-		processRun(run)
-		val draft = pendingDraft(userId)
-		assertThat(draft.path("result").asString()).isEqualTo("offered")
-		assertThat(draft.path("confidence").decimalValue()).isLessThan(java.math.BigDecimal("0.800"))
-		val accepted = acceptDraft(userId, draft, emptyMap())
-		assertThat(accepted.path("result").asString()).isEqualTo("offered")
-		assertThat(accepted.path("needsReview").asBoolean()).isTrue()
+		processRun(createRun(userId, connectionId))
+		val applicationId = jdbcTemplate.queryForObject(
+			"SELECT id FROM applications WHERE user_id = ?", UUID::class.java, userId,
+		) ?: error("자동 확정된 지원이 없습니다.")
+		mockMvc.perform(get("/api/v1/applications/{id}", applicationId).header(USER_HEADER, userId))
+			.andExpect(status().isOk)
+			.andExpect(jsonPath("$.status").value("offered"))
+			.andExpect(jsonPath("$.needsReview").value(true))
+		assertThat(
+			jdbcTemplate.queryForObject(
+				"SELECT count(*) FROM import_drafts WHERE user_id = ?", Long::class.java, userId,
+			),
+		).isZero()
 	}
 
 	@Test
 	fun `오래된 후속 메일은 최종 결과나 완료된 최신 일정을 되돌리지 않는다`() {
 		val userId = UUID.randomUUID()
 		val connectionId = connectNaver(userId)
-		val firstRun = createRun(userId, connectionId)
-		processRun(firstRun)
-		val created = acceptDraft(userId, pendingDraft(userId), emptyMap())
-		val applicationId = created.path("id").asString()
-		val offerRun = createRun(userId, connectionId)
-		processRun(offerRun)
-		val offeredDraft = pendingDraft(userId)
-		val initialSchedule = json(
-			mockMvc.perform(get("/api/v1/applications/{id}/schedule", applicationId).header(USER_HEADER, userId))
-				.andExpect(status().isOk).andReturn().response.contentAsString,
+		processRun(createRun(userId, connectionId))
+		val applicationId = jdbcTemplate.queryForObject(
+			"SELECT id FROM applications WHERE user_id = ?", UUID::class.java, userId,
+		) ?: error("자동 확정된 지원이 없습니다.")
+		processRun(createRun(userId, connectionId))
+		val offered = json(
+			mockMvc.perform(get("/api/v1/applications/{id}", applicationId).header(USER_HEADER, userId))
+				.andExpect(status().isOk)
+				.andExpect(jsonPath("$.status").value("offered"))
+				.andReturn().response.contentAsString,
 		)
-		val offered = acceptDraft(
-			userId, offeredDraft,
-			mapOf(
-				"targetApplicationId" to applicationId,
-				"expectedApplicationVersion" to created.path("version").asLong(),
-				"expectedScheduleVersion" to initialSchedule.path("version").asLong(),
-			),
-		)
-		val completed = json(
-			mockMvc.perform(
+		mockMvc.perform(
 				post("/api/v1/applications/{id}/schedule/complete", applicationId)
 					.header(USER_HEADER, userId).contentType(MediaType.APPLICATION_JSON)
 					.content(
@@ -888,36 +820,22 @@ class ImportApiIntegrationTests @Autowired constructor(
 							mapOf("mutationId" to UUID.randomUUID(), "expectedVersion" to offered.path("version").asLong()),
 						),
 					),
-			).andExpect(status().isOk).andReturn().response.contentAsString,
-		)
-		val completedSchedule = json(
-			mockMvc.perform(get("/api/v1/applications/{id}/schedule", applicationId).header(USER_HEADER, userId))
-				.andExpect(status().isOk)
-				.andExpect(jsonPath("$.completed").value(true))
-				.andReturn().response.contentAsString,
-		)
+			).andExpect(status().isOk)
+		mockMvc.perform(get("/api/v1/applications/{id}/schedule", applicationId).header(USER_HEADER, userId))
+			.andExpect(status().isOk)
+			.andExpect(jsonPath("$.completed").value(true))
 
 		testMailCollector.useOldActive(connectionId)
-		val oldRun = createRun(userId, connectionId)
-		processRun(oldRun)
-		val oldDraft = pendingDraft(userId)
-		val attached = acceptDraft(
-			userId, oldDraft,
-			mapOf(
-				"targetApplicationId" to applicationId,
-				"expectedApplicationVersion" to completed.path("version").asLong(),
-				"expectedScheduleVersion" to completedSchedule.path("version").asLong(),
-			),
-		)
-		assertThat(attached.path("result").asString()).isEqualTo("offered")
+		processRun(createRun(userId, connectionId))
+		mockMvc.perform(get("/api/v1/applications/{id}", applicationId).header(USER_HEADER, userId))
+			.andExpect(status().isOk)
+			.andExpect(jsonPath("$.status").value("offered"))
 		val emailPage = json(
 			mockMvc.perform(
 				get("/api/v1/applications/{id}/emails", applicationId).header(USER_HEADER, userId),
 			).andExpect(status().isOk).andReturn().response.contentAsString,
 		)
-		assertThat(attached.path("emails").get(0).path("id").asString())
-			.isEqualTo(emailPage.path("items").get(0).path("id").asString())
-		assertThat(attached.path("emails").get(0).path("receivedAt").asString())
+		assertThat(emailPage.path("items").get(0).path("receivedAt").asString())
 			.isEqualTo("2026-08-14T02:00:00Z")
 		mockMvc.perform(get("/api/v1/applications/{id}/schedule", applicationId).header(USER_HEADER, userId))
 			.andExpect(status().isOk)
@@ -926,92 +844,29 @@ class ImportApiIntegrationTests @Autowired constructor(
 	}
 
 	@Test
-	fun `완료 전에 받은 후속 메일을 늦게 수락해도 완료 일정을 다시 열지 않는다`() {
-		val userId = UUID.randomUUID()
-		val connectionId = connectNaver(userId)
-		processRun(createRun(userId, connectionId))
-		val created = acceptDraft(userId, pendingDraft(userId), emptyMap())
-		val applicationId = created.path("id").asString()
-		val completed = json(
-			mockMvc.perform(
-				post("/api/v1/applications/{id}/schedule/complete", applicationId)
-					.header(USER_HEADER, userId).contentType(MediaType.APPLICATION_JSON)
-					.content(
-						objectMapper.writeValueAsString(
-							mapOf("mutationId" to UUID.randomUUID(), "expectedVersion" to created.path("version").asLong()),
-						),
-					),
-			).andExpect(status().isOk).andReturn().response.contentAsString,
-		)
-		val completedSchedule = json(
-			mockMvc.perform(get("/api/v1/applications/{id}/schedule", applicationId).header(USER_HEADER, userId))
-				.andExpect(status().isOk).andReturn().response.contentAsString,
-		)
-
-		processRun(createRun(userId, connectionId))
-		acceptDraft(
-			userId,
-			pendingDraft(userId),
-			mapOf(
-				"targetApplicationId" to applicationId,
-				"expectedApplicationVersion" to completed.path("version").asLong(),
-				"expectedScheduleVersion" to completedSchedule.path("version").asLong(),
-			),
-		)
-
-		mockMvc.perform(get("/api/v1/applications/{id}/schedule", applicationId).header(USER_HEADER, userId))
-			.andExpect(status().isOk)
-			.andExpect(jsonPath("$.completed").value(true))
-			.andExpect(jsonPath("$.scheduledAt").value("2026-08-20T05:00:00Z"))
-	}
-
-	@Test
 	fun `더 늦게 받은 일정 변경 메일은 날짜가 앞당겨져도 완료 일정을 다음 전형으로 갱신한다`() {
 		val userId = UUID.randomUUID()
 		val connectionId = connectNaver(userId)
 		processRun(createRun(userId, connectionId))
-		val created = acceptDraft(userId, pendingDraft(userId), emptyMap())
-		val applicationId = created.path("id").asString()
+		val applicationId = jdbcTemplate.queryForObject(
+			"SELECT id FROM applications WHERE user_id = ?", UUID::class.java, userId,
+		) ?: error("자동 확정된 지원이 없습니다.")
 
 		processRun(createRun(userId, connectionId))
-		val offerDraft = pendingDraft(userId)
-		val beforeOfferSchedule = json(
-			mockMvc.perform(get("/api/v1/applications/{id}/schedule", applicationId).header(USER_HEADER, userId))
+		val offered = json(
+			mockMvc.perform(get("/api/v1/applications/{id}", applicationId).header(USER_HEADER, userId))
 				.andExpect(status().isOk).andReturn().response.contentAsString,
 		)
-		val offered = acceptDraft(
-			userId, offerDraft,
-			mapOf(
-				"targetApplicationId" to applicationId,
-				"expectedApplicationVersion" to created.path("version").asLong(),
-				"expectedScheduleVersion" to beforeOfferSchedule.path("version").asLong(),
-			),
-		)
-		val completed = json(
-			mockMvc.perform(
+		mockMvc.perform(
 				post("/api/v1/applications/{id}/schedule/complete", applicationId)
 					.header(USER_HEADER, userId).contentType(MediaType.APPLICATION_JSON)
 					.content(objectMapper.writeValueAsString(mapOf(
 						"mutationId" to UUID.randomUUID(), "expectedVersion" to offered.path("version").asLong(),
 					))),
-			).andExpect(status().isOk).andReturn().response.contentAsString,
-		)
-		val completedSchedule = json(
-			mockMvc.perform(get("/api/v1/applications/{id}/schedule", applicationId).header(USER_HEADER, userId))
-				.andExpect(status().isOk).andReturn().response.contentAsString,
-		)
+			).andExpect(status().isOk)
 
 		testMailCollector.useNewEarlierSchedule(connectionId)
 		processRun(createRun(userId, connectionId))
-		val changedDraft = pendingDraft(userId)
-		acceptDraft(
-			userId, changedDraft,
-			mapOf(
-				"targetApplicationId" to applicationId,
-				"expectedApplicationVersion" to completed.path("version").asLong(),
-				"expectedScheduleVersion" to completedSchedule.path("version").asLong(),
-			),
-		)
 		mockMvc.perform(get("/api/v1/applications/{id}/schedule", applicationId).header(USER_HEADER, userId))
 			.andExpect(status().isOk)
 			.andExpect(jsonPath("$.scheduledAt").value("2026-08-20T00:00:00Z"))
@@ -1023,14 +878,18 @@ class ImportApiIntegrationTests @Autowired constructor(
 		val userId = UUID.randomUUID()
 		val connectionId = connectNaver(userId)
 		processRun(createRun(userId, connectionId))
-		val created = acceptDraft(userId, pendingDraft(userId), emptyMap())
-		val applicationId = created.path("id").asString()
+		val applicationId = jdbcTemplate.queryForObject(
+			"SELECT id FROM applications WHERE user_id = ?", UUID::class.java, userId,
+		) ?: error("자동 확정된 지원이 없습니다.")
+		val created = json(
+			mockMvc.perform(get("/api/v1/applications/{id}", applicationId).header(USER_HEADER, userId))
+				.andExpect(status().isOk).andReturn().response.contentAsString,
+		)
 		val schedule = json(
 			mockMvc.perform(get("/api/v1/applications/{id}/schedule", applicationId).header(USER_HEADER, userId))
 				.andExpect(status().isOk).andReturn().response.contentAsString,
 		)
-		val edited = json(
-			mockMvc.perform(
+		mockMvc.perform(
 				org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put(
 					"/api/v1/applications/{id}/schedule", applicationId,
 				).header(USER_HEADER, userId).contentType(MediaType.APPLICATION_JSON)
@@ -1042,20 +901,10 @@ class ImportApiIntegrationTests @Autowired constructor(
 						"scheduledAt" to "2026-08-30T00:00:00Z", "endsAt" to "2026-08-30T01:00:00Z",
 						"timezone" to "Asia/Seoul", "location" to "직접 입력 장소", "description" to "직접 입력",
 					))),
-			).andExpect(status().isOk).andReturn().response.contentAsString,
-		)
+			).andExpect(status().isOk)
 
 		testMailCollector.useNewEarlierSchedule(connectionId)
 		processRun(createRun(userId, connectionId))
-		val draft = pendingDraft(userId)
-		acceptDraft(
-			userId, draft,
-			mapOf(
-				"targetApplicationId" to applicationId,
-				"expectedApplicationVersion" to edited.path("applicationVersion").asLong(),
-				"expectedScheduleVersion" to edited.path("version").asLong(),
-			),
-		)
 		mockMvc.perform(get("/api/v1/applications/{id}/schedule", applicationId).header(USER_HEADER, userId))
 			.andExpect(status().isOk)
 			.andExpect(jsonPath("$.scheduledAt").value("2026-08-30T00:00:00Z"))
@@ -1064,7 +913,7 @@ class ImportApiIntegrationTests @Autowired constructor(
 	}
 
 	@Test
-	fun `수집 뒤 완료 직전에 자동 확인 동의를 철회하면 초안을 저장하지 않는다`() {
+	fun `수집 뒤 완료 직전에 자동 확인 동의를 철회하면 메시지를 확정하지 않는다`() {
 		val userId = UUID.randomUUID()
 		val connectionId = connectNaver(userId, ongoingSyncConsent = true)
 		assertThat(monitoringScheduler.enqueueDue()).isEqualTo(1)
@@ -1087,80 +936,180 @@ class ImportApiIntegrationTests @Autowired constructor(
 		).isEqualTo("CANCELLED")
 		assertThat(
 			jdbcTemplate.queryForObject(
-				"SELECT count(*) FROM import_drafts WHERE run_id = ?", Long::class.java, claim.runId,
+				"SELECT count(*) FROM applications WHERE user_id = ?", Long::class.java, userId,
+			),
+		).isZero()
+		assertThat(
+			jdbcTemplate.queryForObject(
+				"SELECT count(*) FROM mail_ingestion_ledger WHERE user_id = ?", Long::class.java, userId,
 			),
 		).isZero()
 	}
 
 	@Test
-	fun `낮은 신뢰도 초안은 검토 필요로 생성되고 수락 재시도는 당시 응답을 재생한다`() {
+	fun `이미 확정한 메시지 재수집은 검토 완료 상태를 다시 열지 않는다`() {
 		val userId = UUID.randomUUID()
 		val connectionId = connectNaver(userId)
 		testMailCollector.useLowConfidence(connectionId)
-		createRun(userId, connectionId)
+		val firstRun = createRun(userId, connectionId)
 		assertThat(worker.runOnce()).isTrue()
-		val draft = pendingDraft(userId)
-		assertThat(draft.path("confidence").decimalValue()).isLessThan(java.math.BigDecimal("0.800"))
-		val acceptMutationId = UUID.randomUUID()
-		val acceptBody = decisionBody(draft, mapOf("mutationId" to acceptMutationId))
-		val accepted = json(
-			mockMvc.perform(
-				post("/api/v1/import-drafts/{id}/accept", draft.path("id").asString())
-					.header(USER_HEADER, userId).contentType(MediaType.APPLICATION_JSON).content(acceptBody),
-			).andExpect(status().isOk)
+		val applicationId = jdbcTemplate.queryForObject(
+			"SELECT id FROM applications WHERE user_id = ?", UUID::class.java, userId,
+		) ?: error("자동 확정된 지원이 없습니다.")
+		val imported = json(
+			mockMvc.perform(get("/api/v1/applications/{id}", applicationId).header(USER_HEADER, userId))
+				.andExpect(status().isOk)
 				.andExpect(jsonPath("$.needsReview").value(true))
 				.andReturn().response.contentAsString,
 		)
-		val applicationId = accepted.path("id").asString()
 		mockMvc.perform(
 			post("/api/v1/applications/{id}/review/complete", applicationId)
 				.header(USER_HEADER, userId).contentType(MediaType.APPLICATION_JSON)
 				.content(
 					objectMapper.writeValueAsString(
-						mapOf("mutationId" to UUID.randomUUID(), "expectedVersion" to accepted.path("version").asLong()),
+						mapOf("mutationId" to UUID.randomUUID(), "expectedVersion" to imported.path("version").asLong()),
 					),
 				),
 		).andExpect(status().isOk).andExpect(jsonPath("$.needsReview").value(false))
 
-		mockMvc.perform(
-			post("/api/v1/import-drafts/{id}/accept", draft.path("id").asString())
-				.header(USER_HEADER, userId).contentType(MediaType.APPLICATION_JSON).content(acceptBody),
-		).andExpect(status().isOk)
-			.andExpect(jsonPath("$.needsReview").value(true))
-			.andExpect(jsonPath("$.version").value(accepted.path("version").asLong()))
+		jdbcTemplate.update("DELETE FROM import_runs WHERE id = ?", UUID.fromString(firstRun.path("id").asString()))
+		testMailCollector.reset(connectionId)
+		testMailCollector.useLowConfidence(connectionId)
+		val replay = createRun(userId, connectionId)
+		assertThat(worker.runOnce()).isTrue()
+		mockMvc.perform(get("/api/v1/import-runs/{id}", replay.path("id").asString()).header(USER_HEADER, userId))
+			.andExpect(status().isOk)
+			.andExpect(jsonPath("$.finalizedCount").value(0))
+			.andExpect(jsonPath("$.ignoredCount").value(0))
+			.andExpect(jsonPath("$.duplicateCount").value(1))
+		mockMvc.perform(get("/api/v1/applications/{id}", applicationId).header(USER_HEADER, userId))
+			.andExpect(status().isOk)
+			.andExpect(jsonPath("$.needsReview").value(false))
 	}
 
 	@Test
-	fun `초안 제외 mutation은 expectedVersion까지 같은 요청에만 재생한다`() {
+	fun `legacy FINALIZED 메시지의 exact process key는 후속 메일을 기존 지원에 연결한다`() {
 		val userId = UUID.randomUUID()
 		val connectionId = connectNaver(userId)
+		val application = json(
+			mockMvc.perform(
+				post("/api/v1/applications")
+					.header(USER_HEADER, userId)
+					.contentType(MediaType.APPLICATION_JSON)
+					.content(
+						objectMapper.writeValueAsString(
+							mapOf(
+								"mutationId" to UUID.randomUUID(),
+								"company" to "Acme",
+								"position" to "백엔드 엔지니어",
+								"status" to "applied",
+							),
+						),
+			),
+		).andExpect(status().isCreated).andReturn().response.contentAsString,
+		)
+		val applicationId = UUID.fromString(application.path("id").asString())
+		jdbcTemplate.update(
+			"""
+				INSERT INTO mail_ingestion_ledger (
+				    id, user_id, connection_id, provider_message_id, state, application_id,
+				    first_seen_at, updated_at
+				) VALUES (?, ?, ?, 'legacy-terminal-message', 'FINALIZED', ?, ?, ?)
+			""".trimIndent(),
+			UUID.randomUUID(), userId, connectionId, applicationId,
+			java.sql.Timestamp.from(NOW), java.sql.Timestamp.from(NOW),
+		)
+
 		createRun(userId, connectionId)
-		assertThat(worker.runOnce()).isTrue()
-		val draft = pendingDraft(userId)
-		val mutationId = UUID.randomUUID()
-		mockMvc.perform(
-			post("/api/v1/import-drafts/{id}/reject", draft.path("id").asString())
-				.header(USER_HEADER, userId).contentType(MediaType.APPLICATION_JSON)
-				.content(decisionBody(draft, mapOf("mutationId" to mutationId))),
-		).andExpect(status().isOk)
-		mockMvc.perform(
-			post("/api/v1/import-drafts/{id}/reject", draft.path("id").asString())
-				.header(USER_HEADER, userId).contentType(MediaType.APPLICATION_JSON)
-				.content(
-					objectMapper.writeValueAsString(
-						mapOf("mutationId" to mutationId, "expectedVersion" to 1),
+		completionService.complete(
+			claimService.claimNext() ?: error("claim이 없습니다."),
+			MailCollectionResult(
+				listOf(
+					MailCandidate(
+						ConnectionProvider.NAVER,
+						"legacy-terminal-message",
+						"[Acme] 지원 접수 안내",
+						"recruit@acme.example",
+						NOW,
+						"지원이 접수되었습니다.",
+						providerProcessKeys = setOf("legacy-exact-process"),
 					),
 				),
-		).andExpect(status().isConflict)
+				connectionVersion(connectionId),
+			),
+		)
+		assertThat(jdbcTemplate.queryForObject(
+			"""
+				SELECT application_id FROM provider_process_bindings
+				WHERE user_id = ? AND connection_id = ? AND provider_process_key = ?
+			""".trimIndent(),
+			UUID::class.java,
+			userId,
+			connectionId,
+			"legacy-exact-process",
+		)).isEqualTo(applicationId)
+
+		createRun(userId, connectionId)
+		completionService.complete(
+			claimService.claimNext() ?: error("claim이 없습니다."),
+			MailCollectionResult(
+				listOf(
+					MailCandidate(
+						ConnectionProvider.NAVER,
+						"legacy-follow-up-message",
+						"[Acme] 면접 안내",
+						"recruit@acme.example",
+						NOW.plusSeconds(60),
+						"2026-08-20 14:00 면접입니다.",
+						providerProcessKeys = setOf("legacy-exact-process"),
+					),
+				),
+				connectionVersion(connectionId),
+			),
+		)
+		assertThat(applicationCount(userId)).isEqualTo(1)
+		assertThat(jdbcTemplate.queryForObject(
+			"""
+				SELECT application_id FROM mail_ingestion_ledger
+				WHERE user_id = ? AND connection_id = ? AND provider_message_id = 'legacy-follow-up-message'
+			""".trimIndent(),
+			UUID::class.java,
+			userId,
+			connectionId,
+		)).isEqualTo(applicationId)
 	}
 
 	@Test
-	fun `보존기간 정리 뒤에도 이미 본 메일은 영구 ledger로 다시 초안화하지 않는다`() {
+	fun `같은 회사라도 provider process key가 없으면 지원을 추측 병합하지 않는다`() {
+		val userId = UUID.randomUUID()
+		val connectionId = connectNaver(userId)
+		repeat(2) { index ->
+			createRun(userId, connectionId)
+			val claim = claimService.claimNext() ?: error("claim이 없습니다.")
+			completionService.complete(
+				claim,
+				MailCollectionResult(
+					listOf(
+						MailCandidate(
+							ConnectionProvider.NAVER, "independent-$index", "[Acme] 면접 안내",
+							"recruit@acme.example", NOW.plusSeconds(index.toLong()),
+							"2026-08-20 14:00 면접입니다.",
+						),
+					),
+					connectionVersion(connectionId),
+				),
+			)
+		}
+		assertThat(applicationCount(userId)).isEqualTo(2)
+	}
+
+	@Test
+	fun `실행 보존기간이 끝나도 terminal ledger는 이미 본 메일을 다시 반영하지 않는다`() {
 		val userId = UUID.randomUUID()
 		val connectionId = connectNaver(userId)
 		val firstRun = createRun(userId, connectionId)
 		assertThat(worker.runOnce()).isTrue()
-		assertThat(pendingDraft(userId).path("providerMessageId").asString()).isEqualTo("INBOX:1001")
+		assertThat(applicationCount(userId)).isEqualTo(1)
 		jdbcTemplate.update("DELETE FROM import_runs WHERE id = ?", UUID.fromString(firstRun.path("id").asString()))
 		testMailCollector.reset(connectionId)
 
@@ -1168,11 +1117,12 @@ class ImportApiIntegrationTests @Autowired constructor(
 		assertThat(worker.runOnce()).isTrue()
 		mockMvc.perform(get("/api/v1/import-runs/{id}", replay.path("id").asString()).header(USER_HEADER, userId))
 			.andExpect(status().isOk)
-			.andExpect(jsonPath("$.draftCount").value(0))
-			.andExpect(jsonPath("$.duplicateCount").value(1))
+			.andExpect(jsonPath("$.finalizedCount").value(0))
+			.andExpect(jsonPath("$.ignoredCount").value(0))
+			.andExpect(jsonPath("$.duplicateCount").value(2))
 		mockMvc.perform(get("/api/v1/import-drafts").header(USER_HEADER, userId))
-			.andExpect(status().isOk)
-			.andExpect(jsonPath("$.items.length()").value(0))
+			.andExpect(status().isNotFound)
+		assertThat(applicationCount(userId)).isEqualTo(1)
 	}
 
 	@Test
@@ -1180,34 +1130,9 @@ class ImportApiIntegrationTests @Autowired constructor(
 		val userId = UUID.randomUUID()
 		mockMvc.perform(get("/api/v1/import-runs").param("size", "101").header(USER_HEADER, userId))
 			.andExpect(status().isBadRequest)
-		mockMvc.perform(get("/api/v1/import-drafts").param("size", "0").header(USER_HEADER, userId))
-			.andExpect(status().isBadRequest)
+		mockMvc.perform(get("/api/v1/import-drafts").header(USER_HEADER, userId))
+			.andExpect(status().isNotFound)
 	}
-
-	private fun pendingDraft(userId: UUID): JsonNode = json(
-		mockMvc.perform(get("/api/v1/import-drafts").param("status", "pending").header(USER_HEADER, userId))
-			.andExpect(status().isOk)
-			.andExpect(jsonPath("$.items.length()").value(1))
-			.andReturn().response.contentAsString,
-	).path("items")[0]
-
-	private fun acceptDraft(userId: UUID, draft: JsonNode, extras: Map<String, Any?>): JsonNode {
-		val response = mockMvc.perform(
-			post("/api/v1/import-drafts/{id}/accept", draft.path("id").asString())
-				.header(USER_HEADER, userId)
-				.contentType(MediaType.APPLICATION_JSON)
-				.content(decisionBody(draft, extras)),
-		).andExpect(status().isOk).andReturn().response.contentAsString
-		return json(response)
-	}
-
-	private fun decisionBody(draft: JsonNode, extras: Map<String, Any?>): String =
-		objectMapper.writeValueAsString(
-			linkedMapOf<String, Any?>(
-				"mutationId" to UUID.randomUUID(),
-				"expectedVersion" to draft.path("version").asLong(),
-			).apply { putAll(extras) },
-		)
 
 	private fun connectNaver(userId: UUID, ongoingSyncConsent: Boolean = false): UUID {
 		val response = mockMvc.perform(
@@ -1286,6 +1211,7 @@ class ImportApiIntegrationTests @Autowired constructor(
 
 	private fun importRunBody(connectionId: UUID): String = objectMapper.writeValueAsString(
 		mapOf(
+			"mutationId" to UUID.randomUUID(),
 			"connectionId" to connectionId,
 			"dateFrom" to "2021-01-01",
 			"dateTo" to "2026-08-17",
@@ -1381,6 +1307,7 @@ class ImportApiIntegrationTests @Autowired constructor(
 						ConnectionProvider.NAVER, "NEW-EARLIER:$call", "2차 면접 일정 변경 안내",
 						"recruit@acme.example", Instant.parse("2026-08-17T00:30:00Z"),
 						"면접 일정이 2026-08-20 09:00로 변경되었습니다.",
+						providerProcessKeys = setOf("test-acme-process"),
 					),
 				), connection.version)
 			}
@@ -1389,6 +1316,7 @@ class ImportApiIntegrationTests @Autowired constructor(
 					MailCandidate(
 						ConnectionProvider.NAVER, "OLD-ACTIVE:$call", "지원 접수 채용 일정", "noreply@example.com",
 						Instant.parse("2026-08-14T02:00:00Z"), "2026-08-18 10:00 채용 일정을 확인해 주세요.",
+						providerProcessKeys = setOf("test-acme-process"),
 					),
 				), connection.version)
 			}
@@ -1397,6 +1325,7 @@ class ImportApiIntegrationTests @Autowired constructor(
 					MailCandidate(
 						ConnectionProvider.NAVER, "LOW-OFFER:$call", "최종 합격 채용 안내", "noreply@gmail.com",
 						Instant.parse("2026-08-15T02:00:00Z"), "최종 합격 안내입니다.",
+						providerProcessKeys = setOf("test-acme-process"),
 					),
 				), connection.version)
 			}
@@ -1405,6 +1334,7 @@ class ImportApiIntegrationTests @Autowired constructor(
 					MailCandidate(
 						ConnectionProvider.NAVER, "LOW:$call", "지원 접수 안내", "noreply@example.com",
 						Instant.parse("2026-08-15T02:00:00Z"), "지원이 접수되었습니다.",
+						providerProcessKeys = setOf("test-acme-process"),
 					),
 				), connection.version)
 			}
@@ -1421,6 +1351,7 @@ class ImportApiIntegrationTests @Autowired constructor(
 					} else {
 						"2026-08-20 14:00 면접입니다. 링크와 세부 사항을 확인해 주세요."
 					},
+					providerProcessKeys = setOf("test-acme-process"),
 				),
 				MailCandidate(
 					connection.provider,

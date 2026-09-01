@@ -6,6 +6,8 @@ import com.meenseek.jobvis.application.ScheduleType
 import com.meenseek.jobvis.connection.ConnectionProvider
 import org.springframework.stereotype.Component
 import java.math.BigDecimal
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalDateTime
@@ -20,7 +22,45 @@ data class MailCandidate(
 	val sender: String,
 	val receivedAt: Instant,
 	val textPreview: String,
+	val providerProcessKeys: Set<String> = emptySet(),
+	val stableProviderMessageKey: String? = null,
 )
+
+object ProviderMailKeys {
+	fun gmailProcessKey(threadId: String?): Set<String> =
+		threadId?.trim()?.takeIf(String::isNotEmpty)?.let { setOf(hash("gmail:$it")) } ?: emptySet()
+
+	fun outlookProcessKey(conversationId: String?): Set<String> =
+		conversationId?.trim()?.takeIf(String::isNotEmpty)?.let { setOf(hash("outlook:$it")) } ?: emptySet()
+
+	fun naverStableMessageKey(messageId: String?): String? =
+		normalizeMessageId(messageId)?.let(::hash)
+
+	fun naverProcessKeys(references: String?, inReplyTo: String?, messageId: String?): Set<String> {
+		val referencesIds = messageIds(references)
+		val parentId = messageIds(inReplyTo).firstOrNull()
+		val currentId = normalizeMessageId(messageId)
+		val selected = referencesIds.firstOrNull() ?: parentId ?: currentId
+		return listOfNotNull(selected, currentId).map(::hash).toSortedSet()
+	}
+
+	private fun messageIds(value: String?): List<String> = value
+		?.replace(UNFOLD, " ")
+		?.let { raw -> MESSAGE_ID.findAll(raw).map { normalizeMessageId(it.value) }.filterNotNull().toList() }
+		.orEmpty()
+
+	private fun normalizeMessageId(value: String?): String? = value
+		?.replace(UNFOLD, " ")
+		?.trim()
+		?.takeIf(String::isNotEmpty)
+
+	private fun hash(value: String): String = MessageDigest.getInstance("SHA-256")
+		.digest(value.toByteArray(StandardCharsets.UTF_8))
+		.joinToString("") { byte -> "%02x".format(byte) }
+
+	private val UNFOLD = Regex("\\r?\\n[\\t ]+")
+	private val MESSAGE_ID = Regex("<[^<>\\s]+>")
+}
 
 data class AnalyzedMailCandidate(
 	val sourceSummary: String,
@@ -61,7 +101,8 @@ class DeterministicRecruitmentMailAnalyzer : RecruitmentMailAnalyzer {
 		val stage = when {
 			offered -> ApplicationStage.OFFER
 			interview -> ApplicationStage.INTERVIEW
-			test || screening || rejected -> ApplicationStage.SCREENING
+			test -> ApplicationStage.TEST
+			screening || rejected -> ApplicationStage.SCREENING
 			else -> ApplicationStage.APPLIED
 		}
 		val result = when {

@@ -1,11 +1,12 @@
 package com.meenseek.jobvis.application
 
 import com.meenseek.jobvis.auth.CurrentUserProvider
+import com.meenseek.jobvis.common.BadRequestException
 import jakarta.servlet.http.HttpServletRequest
 import jakarta.validation.Valid
 import org.springframework.http.HttpStatus
-import org.springframework.http.ResponseEntity
 import org.springframework.validation.annotation.Validated
+import org.springframework.web.bind.annotation.DeleteMapping
 import org.springframework.web.bind.annotation.GetMapping
 import org.springframework.web.bind.annotation.PatchMapping
 import org.springframework.web.bind.annotation.PathVariable
@@ -16,7 +17,10 @@ import org.springframework.web.bind.annotation.RequestMapping
 import org.springframework.web.bind.annotation.RequestParam
 import org.springframework.web.bind.annotation.ResponseStatus
 import org.springframework.web.bind.annotation.RestController
+import java.time.LocalDate
+import java.time.format.DateTimeParseException
 import java.util.UUID
+import tools.jackson.databind.node.ObjectNode
 
 @RestController
 @Validated
@@ -25,18 +29,9 @@ class ApplicationController(
 	private val currentUserProvider: CurrentUserProvider,
 	private val applicationService: ApplicationService,
 ) {
-	@GetMapping
-	fun list(
-		@RequestParam(required = false) q: String?,
-		@RequestParam(required = false, defaultValue = "all") status: String?,
-		httpRequest: HttpServletRequest,
-	): ResponseEntity<List<ApplicationListItemResponse>> {
-		val result = applicationService.list(currentUserProvider.currentUserId(httpRequest), q, status)
-		return ResponseEntity.ok()
-			.header("X-Jobvis-Limit", "200")
-			.header("X-Jobvis-Has-Next", result.hasNext.toString())
-			.body(result.items)
-	}
+	@GetMapping("/counts")
+	fun counts(httpRequest: HttpServletRequest): ApplicationCountsResponse =
+		applicationService.counts(currentUserProvider.currentUserId(httpRequest))
 
 	@GetMapping("/page")
 	fun listPage(
@@ -141,6 +136,41 @@ class ApplicationController(
 	): ApplicationScheduleResponse =
 		applicationService.updateSchedule(currentUserProvider.currentUserId(httpRequest), applicationId, request)
 
+	@PatchMapping("/{applicationId}/schedule")
+	fun patchSchedule(
+		@PathVariable applicationId: UUID,
+		@RequestBody body: ObjectNode,
+		httpRequest: HttpServletRequest,
+	): ApplicationResponse {
+		val nextActionAtPresent = body.has("nextActionAt")
+		val nextActionTitlePresent = body.has("nextActionTitle")
+		if (!nextActionAtPresent && !nextActionTitlePresent) {
+			throw BadRequestException("변경할 일정 날짜 또는 제목을 입력해 주세요.")
+		}
+		return applicationService.patchSchedule(
+			currentUserProvider.currentUserId(httpRequest),
+			applicationId,
+			PatchScheduleRequest(
+				mutationId = parseUuid(body, "mutationId"),
+				expectedVersion = parseExpectedVersion(body),
+				nextActionAtPresent = nextActionAtPresent,
+				nextActionAt = if (nextActionAtPresent) parseDate(body, "nextActionAt") else null,
+				nextActionTitlePresent = nextActionTitlePresent,
+				nextActionTitle = if (nextActionTitlePresent) parseTitle(body, "nextActionTitle") else null,
+			),
+		)
+	}
+
+	@DeleteMapping("/{applicationId}/activities/{activityId}")
+	fun deleteActivity(
+		@PathVariable applicationId: UUID,
+		@PathVariable activityId: UUID,
+		@Valid @RequestBody request: MutationRequest,
+		httpRequest: HttpServletRequest,
+	): ApplicationResponse = applicationService.deleteActivity(
+		currentUserProvider.currentUserId(httpRequest), applicationId, activityId, request,
+	)
+
 	@PostMapping("/{applicationId}/review/complete")
 	fun completeReview(
 		@PathVariable applicationId: UUID,
@@ -148,4 +178,46 @@ class ApplicationController(
 		httpRequest: HttpServletRequest,
 	): ApplicationResponse =
 		applicationService.completeReview(currentUserProvider.currentUserId(httpRequest), applicationId, request)
+
+	@PostMapping("/review/complete-bulk")
+	fun completeBulkReview(
+		@Valid @RequestBody request: CompleteBulkReviewRequest,
+		httpRequest: HttpServletRequest,
+	): CompleteBulkReviewResponse = applicationService.completeBulkReview(
+		currentUserProvider.currentUserId(httpRequest), request,
+	)
+
+	private fun parseUuid(body: ObjectNode, field: String): UUID = try {
+		val node = body.get(field)
+		if (node == null || !node.isString || node.stringValue().isBlank()) throw IllegalArgumentException()
+		UUID.fromString(node.stringValue())
+	} catch (_: IllegalArgumentException) {
+		throw BadRequestException("$field 값을 확인해 주세요.")
+	}
+
+	private fun parseExpectedVersion(body: ObjectNode): Long {
+		val node = body.get("expectedVersion")
+		if (node == null || !node.isIntegralNumber || !node.canConvertToLong() || node.longValue() < 0) {
+			throw BadRequestException("expectedVersion 값을 확인해 주세요.")
+		}
+		return node.longValue()
+	}
+
+	private fun parseDate(body: ObjectNode, field: String): LocalDate = try {
+		val node = body.get(field)
+		if (node == null || !node.isString) throw IllegalArgumentException()
+		LocalDate.parse(node.stringValue())
+	} catch (_: DateTimeParseException) {
+		throw BadRequestException("$field 값을 확인해 주세요.")
+	} catch (_: IllegalArgumentException) {
+		throw BadRequestException("$field 값을 확인해 주세요.")
+	}
+
+	private fun parseTitle(body: ObjectNode, field: String): String {
+		val node = body.get(field)
+		if (node == null || !node.isString) throw BadRequestException("$field 값을 확인해 주세요.")
+		val value = node.stringValue().trim()
+		if (value.length > 200) throw BadRequestException("$field 값을 확인해 주세요.")
+		return value
+	}
 }

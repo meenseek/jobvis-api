@@ -26,12 +26,23 @@ interface JobApplicationRepository : JpaRepository<JobApplication, UUID> {
 			  AND (
 			      :status = 'all'
 			      OR (:status = 'review' AND application.needs_review)
-			      OR (:status = 'offered' AND application.result = 'OFFERED')
-			      OR (:status = 'rejected' AND application.result = 'REJECTED')
+			      OR (:status = 'schedulable' AND application.result <> 'REJECTED')
 			      OR (
-			          :status IN ('applied', 'screening', 'interview', 'offer')
-			          AND application.result = 'ACTIVE'
-			          AND lower(application.stage) = :status
+			          NOT application.needs_review
+			          AND (
+			              (:status = 'offered' AND application.result = 'OFFERED')
+			              OR (:status = 'rejected' AND application.result = 'REJECTED')
+			              OR (
+			                  :status = 'application'
+			                  AND application.result = 'ACTIVE'
+			                  AND application.stage IN ('APPLIED', 'SCREENING')
+			              )
+			              OR (
+			                  :status IN ('test', 'interview', 'offer')
+			                  AND application.result = 'ACTIVE'
+			                  AND lower(application.stage) = :status
+			              )
+			          )
 			      )
 			  )
 			ORDER BY application.applied_at DESC, application.created_at DESC, application.id ASC
@@ -46,6 +57,63 @@ interface JobApplicationRepository : JpaRepository<JobApplication, UUID> {
 	): Slice<JobApplication>
 
 	@Query(
+		value = """
+			SELECT count(*)
+			FROM applications application
+			WHERE application.user_id = :userId
+			  AND (
+			      :queryText = ''
+			      OR lower(application.company) LIKE ('%' || :queryText || '%')
+			      OR lower(application.position) LIKE ('%' || :queryText || '%')
+			      OR lower(application.source) LIKE ('%' || :queryText || '%')
+			  )
+			  AND (
+			      :status = 'all'
+			      OR (:status = 'review' AND application.needs_review)
+			      OR (:status = 'schedulable' AND application.result <> 'REJECTED')
+			      OR (
+			          NOT application.needs_review
+			          AND (
+			              (:status = 'offered' AND application.result = 'OFFERED')
+			              OR (:status = 'rejected' AND application.result = 'REJECTED')
+			              OR (
+			                  :status = 'application'
+			                  AND application.result = 'ACTIVE'
+			                  AND application.stage IN ('APPLIED', 'SCREENING')
+			              )
+			              OR (
+			                  :status IN ('test', 'interview', 'offer')
+			                  AND application.result = 'ACTIVE'
+			                  AND lower(application.stage) = :status
+			              )
+			          )
+			      )
+			  )
+		""",
+		nativeQuery = true,
+	)
+	fun countListItems(
+		@Param("userId") userId: UUID,
+		@Param("queryText") queryText: String,
+		@Param("status") status: String,
+	): Long
+
+	@Query("SELECT count(application) FROM JobApplication application WHERE application.storedUserId = :userId")
+	fun countForUser(@Param("userId") userId: UUID): Long
+
+	@Query(
+		"SELECT count(application) FROM JobApplication application " +
+			"WHERE application.storedUserId = :userId AND application.storedNeedsReview = true",
+	)
+	fun countNeedsReview(@Param("userId") userId: UUID): Long
+
+	@Query(
+		value = "SELECT review_revision FROM application_review_states WHERE user_id = :userId",
+		nativeQuery = true,
+	)
+	fun reviewRevision(@Param("userId") userId: UUID): Long?
+
+	@Query(
 		"SELECT application FROM JobApplication application " +
 			"WHERE application.storedId = :id AND application.storedUserId = :userId",
 	)
@@ -57,6 +125,14 @@ interface JobApplicationRepository : JpaRepository<JobApplication, UUID> {
 			"WHERE application.storedId = :id AND application.storedUserId = :userId",
 	)
 	fun findOwnedLocked(@Param("id") id: UUID, @Param("userId") userId: UUID): JobApplication?
+
+	@Lock(LockModeType.PESSIMISTIC_WRITE)
+	@Query(
+		"SELECT application FROM JobApplication application " +
+			"WHERE application.storedUserId = :userId AND application.storedNeedsReview = true " +
+			"ORDER BY application.storedId",
+	)
+	fun findNeedsReviewLocked(@Param("userId") userId: UUID): List<JobApplication>
 }
 
 interface ApplicationScheduleRepository : JpaRepository<ApplicationSchedule, UUID> {
@@ -103,6 +179,7 @@ interface ApplicationScheduleRepository : JpaRepository<ApplicationSchedule, UUI
 }
 
 interface ApplicationEmailRepository : JpaRepository<ApplicationEmail, UUID> {
+	fun countByUserIdAndApplicationId(userId: UUID, applicationId: UUID): Long
 	fun findAllByUserIdAndApplicationIdAndRecordedOrderLessThanEqualOrderByRecordedOrderDesc(
 		userId: UUID,
 		applicationId: UUID,
@@ -119,6 +196,8 @@ interface ApplicationEmailRepository : JpaRepository<ApplicationEmail, UUID> {
 }
 
 interface ApplicationActivityRepository : JpaRepository<ApplicationActivity, UUID> {
+	fun findByIdAndUserIdAndApplicationId(id: UUID, userId: UUID, applicationId: UUID): ApplicationActivity?
+
 	fun findAllByUserIdAndApplicationIdAndRecordedOrderLessThanEqualOrderByRecordedOrderDesc(
 		userId: UUID,
 		applicationId: UUID,
@@ -135,6 +214,7 @@ interface ApplicationActivityRepository : JpaRepository<ApplicationActivity, UUI
 }
 
 interface ApplicationChangeRepository : JpaRepository<ApplicationChange, UUID> {
+	fun countByUserIdAndApplicationId(userId: UUID, applicationId: UUID): Long
 	fun findAllByUserIdAndApplicationIdAndRecordedOrderLessThanEqualOrderByRecordedOrderDesc(
 		userId: UUID,
 		applicationId: UUID,

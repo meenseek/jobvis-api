@@ -2,7 +2,8 @@ package com.meenseek.jobvis
 
 import com.meenseek.jobvis.auth.LoginRateLimiter
 import com.meenseek.jobvis.common.TooManyRequestsException
-import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.catchThrowable
 import org.junit.jupiter.api.Test
 import java.time.Clock
 import java.time.Duration
@@ -20,7 +21,8 @@ class LoginRateLimiterTests {
 		)
 		limiter.check("192.0.2.1", "challenge")
 		limiter.check("192.0.2.2", "challenge")
-		assertThatThrownBy { limiter.check("192.0.2.3", "challenge") }
-			.isInstanceOf(TooManyRequestsException::class.java)
+		val error = catchThrowable { limiter.check("192.0.2.3", "challenge") }
+		assertThat(error).isInstanceOf(TooManyRequestsException::class.java)
+		assertThat((error as TooManyRequestsException).retryAfterSeconds).isEqualTo(600)
 	}
 }

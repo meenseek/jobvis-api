@@ -6,12 +6,27 @@ import com.meenseek.jobvis.application.ScheduleType
 import com.meenseek.jobvis.connection.ConnectionProvider
 import com.meenseek.jobvis.imports.DeterministicRecruitmentMailAnalyzer
 import com.meenseek.jobvis.imports.MailCandidate
+import com.meenseek.jobvis.imports.ProviderMailKeys
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 import java.time.Instant
 
 class RecruitmentMailAnalyzerTests {
 	private val analyzer = DeterministicRecruitmentMailAnalyzer()
+
+	@Test
+	fun `Naver Message-ID key는 unfold와 trim만 적용하고 대소문자를 보존한다`() {
+		val canonical = ProviderMailKeys.naverStableMessageKey("  <AbC@example.com>  ")
+		val unfolded = ProviderMailKeys.naverStableMessageKey("\r\n\t<AbC@example.com>\r\n ")
+		val differentCase = ProviderMailKeys.naverStableMessageKey("<abc@example.com>")
+
+		assertThat(canonical)
+			.isEqualTo("11e3af5252d90856e0c19ca0917a61817846560d9bb4bc8b6f2bd794e777e77f")
+		assertThat(unfolded).isEqualTo(canonical)
+		assertThat(differentCase)
+			.isEqualTo("a1c01306268e0d2c69f4426068f5e4d0ab1e61c29f34afe61da456b48b8dfea6")
+			.isNotEqualTo(canonical)
+	}
 
 	@Test
 	fun `한국어 오전과 오후를 24시간 시각으로 변환한다`() {
@@ -340,6 +355,15 @@ class RecruitmentMailAnalyzerTests {
 		assertThat(analyze("면접은 2026년 8월 25일 오후 3시 30분 45초입니다.").scheduledAt).isNull()
 		assertThat(analyze("면접은 2026년 8월 25일 오후 3시 123분입니다.").scheduledAt).isNull()
 		assertThat(analyze("면접은 2026년 8월 25일 오후 3시 30분 123초입니다.").scheduledAt).isNull()
+	}
+
+	@Test
+	fun `코딩 테스트 메일은 별도 테스트 단계로 분류한다`() {
+		val result = analyze("코딩 테스트는 2026년 8월 25일 오후 3시입니다.")
+
+		assertThat(result.stage).isEqualTo(ApplicationStage.TEST)
+		assertThat(result.highestStageReached).isEqualTo(ApplicationStage.TEST)
+		assertThat(result.scheduleType).isEqualTo(ScheduleType.TEST)
 	}
 
 	@Test

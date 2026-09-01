@@ -437,6 +437,7 @@ class OfficialMailCollector(
 						headers["from"].orEmpty(),
 						receivedAt,
 						message.path("snippet").asString().take(PREVIEW_LIMIT),
+						ProviderMailKeys.gmailProcessKey(message.path("threadId").asString()),
 					)
 				}
 				pageToken = page.path("nextPageToken").asString().takeIf(String::isNotBlank)
@@ -553,7 +554,7 @@ class OfficialMailCollector(
 		val window = mailCollectionWindow(dateFrom, dateTo)
 		val results = mutableListOf<MailCandidate>()
 		var nextUri: String? = UriComponentsBuilder.fromUriString("https://graph.microsoft.com/v1.0/me/messages")
-			.queryParam("\$select", "id,subject,from,receivedDateTime,bodyPreview")
+			.queryParam("\$select", "id,conversationId,subject,from,receivedDateTime,bodyPreview")
 			.queryParam(
 				"\$filter", "receivedDateTime ge ${window.fromInclusive} and receivedDateTime lt ${window.toExclusive}",
 			)
@@ -585,6 +586,7 @@ class OfficialMailCollector(
 						message.path("from").path("emailAddress").path("address").asString(),
 						receivedAt,
 						message.path("bodyPreview").asString().take(PREVIEW_LIMIT),
+						ProviderMailKeys.outlookProcessKey(message.path("conversationId").asString()),
 					)
 				}
 				nextUri = page.path("@odata.nextLink").asString().takeIf(String::isNotBlank)
@@ -676,6 +678,9 @@ class OfficialMailCollector(
 				inbox.fetch(messages, FetchProfile().apply {
 					add(FetchProfile.Item.ENVELOPE)
 					add(UIDFolder.FetchProfileItem.UID)
+					add("Message-ID")
+					add("In-Reply-To")
+					add("References")
 				})
 				for (message in messages) {
 					val uid = uidFolder.getUID(message)
@@ -688,6 +693,9 @@ class OfficialMailCollector(
 					val receivedAt = (message.receivedDate ?: message.sentDate)?.toInstant() ?: continue
 					if (!window.contains(receivedAt)) continue
 					ensureNaverImportCapacity(results.size, maxMessages, credential.connectionVersion)
+					val messageId = message.getHeader("Message-ID")?.joinToString(" ")
+					val inReplyTo = message.getHeader("In-Reply-To")?.joinToString(" ")
+					val references = message.getHeader("References")?.joinToString(" ")
 					results += MailCandidate(
 						ConnectionProvider.NAVER,
 						"${inbox.fullName}:$uidValidity:$uid",
@@ -696,6 +704,8 @@ class OfficialMailCollector(
 						receivedAt,
 						mimeTextExtractor.extract(message).replace(HTML_TAG, " ")
 							.replace(WHITESPACE, " ").trim().take(PREVIEW_LIMIT),
+						ProviderMailKeys.naverProcessKeys(references, inReplyTo, messageId),
+						ProviderMailKeys.naverStableMessageKey(messageId),
 					)
 				}
 			}

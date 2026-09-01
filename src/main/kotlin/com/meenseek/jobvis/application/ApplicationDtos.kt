@@ -1,5 +1,6 @@
 package com.meenseek.jobvis.application
 
+import com.fasterxml.jackson.annotation.JsonInclude
 import jakarta.validation.constraints.NotBlank
 import jakarta.validation.constraints.PositiveOrZero
 import jakarta.validation.constraints.Size
@@ -16,7 +17,7 @@ data class CreateRequest(
 	@field:Size(max = 160)
 	val position: String,
 	@field:NotBlank
-	val stage: String,
+	val status: String,
 )
 
 data class UpdateDetailsRequest(
@@ -33,6 +34,7 @@ data class UpdateDetailsRequest(
 	val location: String?,
 	@field:Size(max = 80)
 	val employmentType: String?,
+	val appliedAt: LocalDate,
 )
 
 data class UpdateMemoRequest(
@@ -57,12 +59,21 @@ data class MutationRequest(
 	val expectedVersion: Long,
 )
 
+data class PatchScheduleRequest(
+	val mutationId: UUID,
+	val expectedVersion: Long,
+	val nextActionAtPresent: Boolean,
+	val nextActionAt: LocalDate?,
+	val nextActionTitlePresent: Boolean,
+	val nextActionTitle: String?,
+)
+
 data class UpdateScheduleRequest(
 	val mutationId: UUID,
 	@field:PositiveOrZero
 	val expectedVersion: Long,
 	@field:PositiveOrZero
-	val expectedScheduleVersion: Long,
+	val expectedScheduleVersion: Long? = null,
 	@field:NotBlank
 	val scheduleType: String,
 	@field:NotBlank
@@ -86,9 +97,11 @@ data class ApplicationScheduleResponse(
 	val version: Long,
 	val scheduleType: String,
 	val action: String,
+	val allDay: Boolean,
+	val date: LocalDate?,
 	val scheduledAt: Instant?,
 	val endsAt: Instant?,
-	val timezone: String,
+	val timezone: String?,
 	val location: String,
 	val description: String,
 	val completed: Boolean,
@@ -103,20 +116,17 @@ data class ApplicationResponse(
 	val location: String,
 	val employmentType: String,
 	val appliedAt: LocalDate,
-	val stage: String,
-	val highestStageReached: String,
-	val screeningPassed: Boolean,
-	val result: String,
+	val status: String,
 	val needsReview: Boolean,
 	val source: String,
-	val nextAction: String,
-	val scheduleType: String,
-	val nextActionAt: LocalDate?,
-	val nextActionCompleted: Boolean,
+	val sourceType: String,
+	val schedule: ApplicationScheduleSummaryResponse?,
 	val memo: String,
-	val emails: List<EmailResponse>,
-	val activities: List<ActivityResponse>,
-	val changes: List<ChangeResponse>,
+)
+
+data class ApplicationScheduleSummaryResponse(
+	val nextActionTitle: String,
+	val nextActionAt: LocalDate,
 )
 
 data class ApplicationListItemResponse(
@@ -124,19 +134,10 @@ data class ApplicationListItemResponse(
 	val version: Long,
 	val company: String,
 	val position: String,
-	val location: String,
-	val employmentType: String,
 	val appliedAt: LocalDate,
-	val stage: String,
-	val highestStageReached: String,
-	val screeningPassed: Boolean,
-	val result: String,
+	val status: String,
 	val needsReview: Boolean,
 	val source: String,
-	val nextAction: String,
-	val scheduleType: String,
-	val nextActionAt: LocalDate?,
-	val nextActionCompleted: Boolean,
 )
 
 data class ApplicationListPageResponse(
@@ -144,11 +145,31 @@ data class ApplicationListPageResponse(
 	val page: Int,
 	val limit: Int,
 	val hasNext: Boolean,
+	val filteredCount: Long,
+	val totalCount: Long,
+	val needsReviewCount: Long,
+	val reviewRevision: Long,
+)
+
+data class ApplicationCountsResponse(val totalCount: Long)
+
+data class CompleteBulkReviewRequest(
+	val mutationId: UUID,
+	@field:PositiveOrZero
+	val expectedReviewRevision: Long,
+)
+
+data class CompleteBulkReviewResponse(
+	val completedCount: Int,
+	val needsReviewCount: Long,
+	val reviewRevision: Long,
 )
 
 data class HistoryPageResponse<T>(
 	val items: List<T>,
 	val nextCursor: Long?,
+	@field:JsonInclude(JsonInclude.Include.NON_NULL)
+	val totalCount: Long? = null,
 )
 
 data class EmailResponse(
@@ -174,8 +195,4 @@ data class ChangeResponse(
 	val occurredAt: Instant,
 )
 
-internal fun ApplicationResponse.compact(): ApplicationResponse = copy(
-	emails = emptyList(),
-	activities = emptyList(),
-	changes = emptyList(),
-)
+internal fun ApplicationResponse.compact(): ApplicationResponse = this
