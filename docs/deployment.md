@@ -1,6 +1,6 @@
 # Jobvis API 배포 계약
 
-Jobvis API는 특정 클라우드 SDK에 의존하지 않는 OCI 컨테이너와 PostgreSQL로 구성됩니다. CPU·스토리지·네트워크·컨테이너 실행 환경을 제공하는 클라우드라면 동일 이미지를 사용할 수 있습니다. 모두의 AI 실험실에도 이 경계를 전제로 올릴 수 있지만, 실제 계정에 영구 PostgreSQL 볼륨·고정 공개 주소·TLS 인그레스가 제공되는지는 배포 전에 콘솔에서 확인해야 합니다.
+Jobvis API는 특정 클라우드 SDK에 의존하지 않는 OCI 컨테이너와 PostgreSQL로 구성됩니다. CPU·스토리지·네트워크·컨테이너 실행 환경을 제공하는 클라우드라면 동일 이미지를 사용할 수 있습니다. 모두의 AI 실험실 단일 VM에서는 이 저장소의 [검증된 Compose 운영 경계](../deploy/lab/README.md)를 사용합니다. 실제 VM의 영구 디스크·고정 공개 주소와 90일 만료일은 콘솔에서 확인하고, 만료 14일 전부터 문서의 이전 절차를 실행합니다.
 
 ## Migration history
 
@@ -15,6 +15,14 @@ V3~V9는 순서대로 `TEST` 단계, 단일 활성 메일 연결, import 실행 
 감사를 추가합니다. 적용 책임자는 `meenseek` Jobvis 데이터 운영자입니다. V9 rollout의
 `completed_at` 확인과 필요한 Naver ledger reconciliation이 모두 끝날 때 이 배포 부채가
 끝납니다. V6~V9는 기존 데이터를 보존하기 위한 append-only 전환이므로 squash하지 않습니다.
+
+V10은 V9가 이미 공유된 뒤 발견된 신규 설치 차단을 해소합니다. V10 적용 시점에
+`import_drafts`와 `mail_ingestion_ledger`가 모두 비어 있고 rollout이 미완료인 DB에만 target
+constraint와 `completed_at`을 같은 migration transaction에서 설치합니다. 메일 이력이 하나라도
+있는 DB는 자동 완료하지 않고 기존 V9 운영 절차를 그대로 따릅니다. 대상은 V9를 적용하는 신규·
+비폐기 PostgreSQL이며 적용 책임자는 `meenseek` Jobvis 데이터 운영자입니다. 모든 활성 DB가
+V10 이상이고 빈 신규 DB의 import smoke test와 기존 DB의 V9 rollout이 완료되면 V10 전환 부채가
+끝납니다. V10도 적용 뒤 append-only로 보존합니다.
 
 V3는 어떤 V3+ schema 변경도 커밋하기 전에 다음 legacy preflight를 한 transaction에서
 검사합니다. `PENDING` draft가 0이고, 사용자별 non-revoked MAIL 연결이 최대 하나이며,
@@ -54,6 +62,7 @@ docker build -t jobvis-api:local .
 | `JOBVIS_CORS_ALLOWED_ORIGINS` | 예 | 쉼표로 구분한 정확한 프론트엔드 origin 목록 |
 | `JOBVIS_GOOGLE_CLIENT_ID` | Google 로그인 시 | Google OIDC 클라이언트 ID |
 | `JOBVIS_KAKAO_CLIENT_ID` | Kakao 로그인 시 | Kakao OIDC 앱 키/클라이언트 ID |
+| `JOBVIS_TRUSTED_SITE_SECRET` | private Sites 연결 시 | 32바이트 이상의 Web/API 공유 비밀. Sites 서버가 전달한 플랫폼 사용자만 내부 사용자로 매핑할 때 사용 |
 | `JOBVIS_GMAIL_CLIENT_ID` / `JOBVIS_GMAIL_CLIENT_SECRET` | Gmail 연결 시 | Gmail 읽기 전용 OAuth 클라이언트 |
 | `JOBVIS_MICROSOFT_CLIENT_ID` / `JOBVIS_MICROSOFT_CLIENT_SECRET` | Outlook 연결 시 | Microsoft Graph `Mail.Read` OAuth 클라이언트 |
 | `JOBVIS_GOOGLE_CALENDAR_CLIENT_ID` / `JOBVIS_GOOGLE_CALENDAR_CLIENT_SECRET` | Calendar 내보내기 시 | 별도 Calendar events OAuth 클라이언트 |
@@ -70,6 +79,14 @@ docker build -t jobvis-api:local .
 각 import claim의 heartbeat가 서로를 막지 않도록 `JOBVIS_IMPORT_WORKER_CONCURRENCY`는 1~32이면서 `JOBVIS_DB_MAX_POOL_SIZE` 이하여야 합니다. `JOBVIS_GMAIL_FETCH_CONCURRENCY`는 1~16, `JOBVIS_IMPORT_HEARTBEAT_INTERVAL`은 1~30초, `JOBVIS_IMPORT_WORKER_SHUTDOWN_GRACE`는 0초~5분이어야 합니다. heartbeat는 worker 수만큼 병렬 실행되며 애플리케이션이 시작 시 이 범위를 모두 검증합니다.
 
 전달 헤더는 기본적으로 신뢰하지 않습니다. 인그레스가 클라이언트의 `Forwarded`/`X-Forwarded-*` 값을 제거하고 직접 다시 쓰는 구성이 확인된 경우에만 `JOBVIS_FORWARD_HEADERS_STRATEGY=framework`를 사용합니다. Jobvis Web 인증 BFF는 이 정리된 `Forwarded`/`X-Forwarded-For`를 API까지 전달하며, API의 로그인 rate limit은 복원된 클라이언트 주소를 기준으로 적용됩니다.
+
+private Sites 배포에서는 Sites가 인증한 `oai-authenticated-user-id`를 Web BFF가 서버 전용
+`X-Jobvis-Site-User-Id`로 전달할 수 있습니다. 이 경로는 Web과 API 양쪽에 같은
+`JOBVIS_TRUSTED_SITE_SECRET`이 32바이트 이상으로 설정된 경우에만 활성화됩니다. API는 공유
+비밀을 상수 시간으로 비교한 뒤 사용자 식별자를 Jobvis 전용 고정 네임스페이스의 SHA-256 기반
+UUID로 변환합니다. 따라서 공유 비밀을 교체해도 기존 사용자의 데이터 연결은 유지됩니다. 브라우저가
+직접 보낸 헤더나 비밀이 없거나 다른 요청은 세션 인증으로 우회하지 않고 `401`로 거부합니다.
+공개 Sites나 신뢰할 수 없는 프록시에서는 이 경로를 사용하지 않습니다.
 
 ## 헬스체크와 종료
 
@@ -186,4 +203,4 @@ advisory transaction lock을 사용해 서로 다른 인스턴스에서도 직�
 8. 로그에 토큰·앱 비밀번호·메일 본문이 출력되지 않는지 확인합니다.
 9. DB 용량, 만료 lease, 가져오기 실패 코드, transient 재시도, 연결 재승인 상태, readiness를 모니터링합니다.
 
-모두의 AI 실험실 환경에서 관리형 PostgreSQL 또는 영구 볼륨과 고정 TLS 인그레스가 확인되지 않으면 API 컨테이너만 실험실에 두고 PostgreSQL은 별도의 관리형 서비스에 두는 구성이 안전합니다. 실제 인프라 생성과 외부 OAuth 앱 등록은 이 저장소의 범위에 포함하지 않습니다.
+모두의 AI 실험실 VM의 디스크가 재시작 뒤에도 유지되는지는 첫 배포 전에 확인합니다. VM 자체 삭제·만료에는 로컬 volume도 함께 사라질 수 있으므로 매일 VM 외부 백업이 필수입니다. 실제 VM 생성, DNS 변경, 외부 OAuth 앱 등록은 운영 계정 권한이 있어야 수행할 수 있습니다.

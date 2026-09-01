@@ -24,7 +24,7 @@ class LocalCurrentUserProvider(
 		}
 
 		val userId = request.getHeader(USER_ID_HEADER).toUserId()
-		userAccountRepository.provisionLocalUser(userId, Instant.now(clock))
+		userAccountRepository.provisionUser(userId, Instant.now(clock))
 		return userId
 	}
 

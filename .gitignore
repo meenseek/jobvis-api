@@ -37,8 +37,13 @@ out/
 
 ### Local secrets ###
 .env*
+!.env.example
+!**/.env.example
 *.pem
 *.key
 *.p12
 *.jks
 *.keystore
+
+### Local deployment data ###
+deploy/lab/backups/

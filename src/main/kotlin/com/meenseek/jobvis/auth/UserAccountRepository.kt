@@ -22,5 +22,5 @@ interface UserAccountRepository : JpaRepository<UserAccount, UUID> {
 		""",
 		nativeQuery = true,
 	)
-	fun provisionLocalUser(userId: UUID, now: Instant)
+	fun provisionUser(userId: UUID, now: Instant)
 }

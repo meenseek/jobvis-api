@@ -5,7 +5,6 @@ import com.meenseek.jobvis.common.BadRequestException
 import jakarta.servlet.http.HttpServletRequest
 import org.springframework.format.annotation.DateTimeFormat
 import org.springframework.jdbc.core.JdbcTemplate
-import org.springframework.transaction.annotation.Transactional
 import org.springframework.web.bind.annotation.GetMapping
 import org.springframework.web.bind.annotation.RequestMapping
 import org.springframework.web.bind.annotation.RequestParam
@@ -33,7 +32,6 @@ class CalendarScheduleController(
 	private val jdbcTemplate: JdbcTemplate,
 ) {
 	@GetMapping("/schedules")
-	@Transactional(readOnly = true)
 	fun schedules(
 		@RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) from: LocalDate,
 		@RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) to: LocalDate,

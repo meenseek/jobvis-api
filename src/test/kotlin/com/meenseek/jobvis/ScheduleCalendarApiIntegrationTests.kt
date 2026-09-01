@@ -70,6 +70,27 @@ class ScheduleCalendarApiIntegrationTests @Autowired constructor(
 	}
 
 	@Test
+	fun `캘린더 조회는 새 로컬 사용자를 준비한 뒤 빈 일정을 반환한다`() {
+		val userId = UUID.randomUUID()
+
+		mockMvc.perform(
+			get("/api/v1/calendar/schedules")
+				.header(USER_HEADER, userId)
+				.param("from", "2026-08-01")
+				.param("to", "2026-08-31"),
+		).andExpect(status().isOk)
+			.andExpect(jsonPath("$.items").isEmpty)
+
+		assertThat(
+			jdbcTemplate.queryForObject(
+				"SELECT count(*) FROM users WHERE id = ?",
+				Long::class.java,
+				userId,
+			),
+		).isEqualTo(1)
+	}
+
+	@Test
 	fun `단일 일정을 수정하고 확인한 미리보기만 Google Calendar에 멱등적으로 반영한다`() {
 		calendarCalls.set(0)
 		val userId = UUID.randomUUID()

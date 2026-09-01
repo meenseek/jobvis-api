@@ -48,6 +48,75 @@ class DatabaseIntegrationTests @Autowired constructor(
 	fun `빈 DB 마이그레이션은 완료되고 재실행은 안전하다`() {
 		assertThat(flyway.info().pending()).isEmpty()
 		assertThat(flyway.migrate().migrationsExecuted).isZero()
+		assertThat(
+			jdbcTemplate.queryForObject(
+				"SELECT completed_at IS NOT NULL FROM mail_finalization_rollout_state WHERE singleton = true",
+				Boolean::class.java,
+			),
+		).isTrue()
+		assertThat(
+			jdbcTemplate.queryForList(
+				"""
+					SELECT conname FROM pg_constraint
+					WHERE connamespace = current_schema()::regnamespace
+					  AND conname IN (
+					      'ck_mail_ingestion_ledger_state_target',
+					      'ck_import_drafts_status_target',
+					      'ck_import_drafts_decision_target'
+					  )
+					ORDER BY conname
+				""".trimIndent(),
+				String::class.java,
+			),
+		).containsExactly(
+			"ck_import_drafts_decision_target",
+			"ck_import_drafts_status_target",
+			"ck_mail_ingestion_ledger_state_target",
+		)
+	}
+
+	@Test
+	fun `V10은 애플리케이션 bootstrap 없이 빈 schema의 메일 rollout을 완료한다`() {
+		val schema = "migration_empty_rollout_${UUID.randomUUID().toString().replace("-", "")}"
+		val quotedSchema = "\"$schema\""
+		jdbcTemplate.execute("CREATE SCHEMA $quotedSchema")
+		try {
+			val schemaFlyway = Flyway.configure()
+				.dataSource(dataSource)
+				.locations("classpath:db/migration")
+				.schemas(schema)
+				.defaultSchema(schema)
+				.target(MigrationVersion.fromVersion("10"))
+				.load()
+			assertThat(schemaFlyway.migrate().migrationsExecuted).isEqualTo(10)
+			assertThat(
+				jdbcTemplate.queryForObject(
+					"SELECT completed_at IS NOT NULL FROM $quotedSchema.mail_finalization_rollout_state WHERE singleton = true",
+					Boolean::class.java,
+				),
+			).isTrue()
+			assertThat(
+				jdbcTemplate.queryForList(
+					"""
+						SELECT conname FROM pg_constraint
+						WHERE connamespace = '$schema'::regnamespace
+						  AND conname IN (
+						      'ck_mail_ingestion_ledger_state_target',
+						      'ck_import_drafts_status_target',
+						      'ck_import_drafts_decision_target'
+						  )
+						ORDER BY conname
+					""".trimIndent(),
+					String::class.java,
+				),
+			).containsExactly(
+				"ck_import_drafts_decision_target",
+				"ck_import_drafts_status_target",
+				"ck_mail_ingestion_ledger_state_target",
+			)
+		} finally {
+			jdbcTemplate.execute("DROP SCHEMA $quotedSchema CASCADE")
+		}
 	}
 
 	@Test
@@ -374,6 +443,19 @@ class DatabaseIntegrationTests @Autowired constructor(
 						""".trimIndent(),
 						ledgerId, userId, connectionId, Timestamp.from(NOW), Timestamp.from(NOW),
 					)
+
+					val v10Flyway = Flyway.configure()
+						.dataSource(dataSource)
+						.locations("classpath:db/migration")
+						.schemas(schema)
+						.defaultSchema(schema)
+						.target(MigrationVersion.fromVersion("10"))
+						.load()
+					assertThat(v10Flyway.migrate().migrationsExecuted).isOne()
+					assertThat(scoped.queryForObject(
+						"SELECT completed_at IS NULL FROM mail_finalization_rollout_state WHERE singleton = true",
+						Boolean::class.java,
+					)).isTrue()
 
 					assertThat(transaction.execute { rollout.reconcileAndCompleteIfReady() }).isFalse()
 					assertThat(scoped.queryForObject(

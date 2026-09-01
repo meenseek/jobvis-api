@@ -1,0 +1,110 @@
+name: jobvis-lab
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  postgres:
+    image: postgres:18.4-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${JOBVIS_POSTGRES_DB:?JOBVIS_POSTGRES_DB is required}
+      POSTGRES_USER: ${JOBVIS_POSTGRES_USER:?JOBVIS_POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${JOBVIS_POSTGRES_PASSWORD:?JOBVIS_POSTGRES_PASSWORD is required}
+    volumes:
+      - jobvis-postgres:/var/lib/postgresql/18/docker
+    networks:
+      - database
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    mem_limit: ${JOBVIS_POSTGRES_MEMORY_LIMIT:-768m}
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+  api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: jobvis-api:lab
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      JOBVIS_DATABASE_URL: jdbc:postgresql://postgres:5432/${JOBVIS_POSTGRES_DB:?JOBVIS_POSTGRES_DB is required}
+      JOBVIS_DATABASE_USERNAME: ${JOBVIS_POSTGRES_USER:?JOBVIS_POSTGRES_USER is required}
+      JOBVIS_DATABASE_PASSWORD: ${JOBVIS_POSTGRES_PASSWORD:?JOBVIS_POSTGRES_PASSWORD is required}
+      JOBVIS_ENCRYPTION_KEY_BASE64: ${JOBVIS_ENCRYPTION_KEY_BASE64:?JOBVIS_ENCRYPTION_KEY_BASE64 is required}
+      JOBVIS_TRUSTED_SITE_SECRET: ${JOBVIS_TRUSTED_SITE_SECRET:?JOBVIS_TRUSTED_SITE_SECRET is required}
+      JOBVIS_SERVER_ADDRESS: 0.0.0.0
+      PORT: 8080
+      JOBVIS_CORS_ALLOWED_ORIGINS: ${JOBVIS_WEB_ORIGIN:?JOBVIS_WEB_ORIGIN is required}
+      JOBVIS_OAUTH_REDIRECT_URIS: ${JOBVIS_WEB_ORIGIN:?JOBVIS_WEB_ORIGIN is required}/oauth/callback
+      JOBVIS_FORWARD_HEADERS_STRATEGY: framework
+      JOBVIS_DB_MAX_POOL_SIZE: 4
+      JOBVIS_IMPORT_WORKER_CONCURRENCY: 2
+      JOBVIS_GMAIL_FETCH_CONCURRENCY: 2
+      JOBVIS_GOOGLE_CLIENT_ID: ${JOBVIS_GOOGLE_CLIENT_ID:-}
+      JOBVIS_KAKAO_CLIENT_ID: ${JOBVIS_KAKAO_CLIENT_ID:-}
+      JOBVIS_GMAIL_CLIENT_ID: ${JOBVIS_GMAIL_CLIENT_ID:-}
+      JOBVIS_GMAIL_CLIENT_SECRET: ${JOBVIS_GMAIL_CLIENT_SECRET:-}
+      JOBVIS_MICROSOFT_CLIENT_ID: ${JOBVIS_MICROSOFT_CLIENT_ID:-}
+      JOBVIS_MICROSOFT_CLIENT_SECRET: ${JOBVIS_MICROSOFT_CLIENT_SECRET:-}
+      JOBVIS_GOOGLE_CALENDAR_CLIENT_ID: ${JOBVIS_GOOGLE_CALENDAR_CLIENT_ID:-}
+      JOBVIS_GOOGLE_CALENDAR_CLIENT_SECRET: ${JOBVIS_GOOGLE_CALENDAR_CLIENT_SECRET:-}
+    networks:
+      - edge
+      - database
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    stop_grace_period: 75s
+    mem_limit: ${JOBVIS_API_MEMORY_LIMIT:-1024m}
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+  caddy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      JOBVIS_API_HOST: ${JOBVIS_API_HOST:?JOBVIS_API_HOST is required}
+      JOBVIS_TLS_EMAIL: ${JOBVIS_TLS_EMAIL:?JOBVIS_TLS_EMAIL is required}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - edge
+    mem_limit: ${JOBVIS_CADDY_MEMORY_LIMIT:-192m}
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+networks:
+  edge:
+  database:
+    internal: true
+
+volumes:
+  jobvis-postgres:
+  caddy-data:
+  caddy-config:

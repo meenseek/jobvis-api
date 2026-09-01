@@ -1,0 +1,23 @@
+{
+	email {$JOBVIS_TLS_EMAIL}
+}
+
+{$JOBVIS_API_HOST} {
+	encode zstd gzip
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+	}
+
+	reverse_proxy api:8080 {
+		# 표준 Forwarded는 제거하고 Caddy가 X-Forwarded-*를 직접 다시 씁니다.
+		header_up -Forwarded
+		health_uri /actuator/health/readiness
+		health_interval 15s
+		health_timeout 5s
+	}
+}

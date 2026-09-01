@@ -6,6 +6,8 @@
 build
 *.iml
 .env*
+**/.env*
+deploy/lab/backups
 *.pem
 *.key
 *.p12
