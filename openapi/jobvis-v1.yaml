@@ -769,7 +769,7 @@ components:
   schemas:
     LoginProvider:
       type: string
-      enum: [google, kakao]
+      enum: [google]
     LoginProviderResponse:
       type: object
       required: [provider, configured]

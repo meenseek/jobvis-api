@@ -42,6 +42,8 @@ class AuthApiIntegrationTests @Autowired constructor(
 	fun `검증된 외부 ID 토큰은 서버 세션으로 교환되고 로그아웃하면 즉시 폐기된다`() {
 		mockMvc.perform(get("/api/v1/auth/providers"))
 			.andExpect(status().isOk)
+			.andExpect(jsonPath("$.length()").value(1))
+			.andExpect(jsonPath("$[0].provider").value("google"))
 			.andExpect(jsonPath("$[0].configured").value(true))
 		val challenge = createChallenge()
 

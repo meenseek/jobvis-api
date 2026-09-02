@@ -21,8 +21,6 @@ import java.util.concurrent.ConcurrentHashMap
 class OidcIdentityTokenVerifier(
 	@Value("\${jobvis.auth.google-client-id:}")
 	private val googleClientId: String,
-	@Value("\${jobvis.auth.kakao-client-id:}")
-	private val kakaoClientId: String,
 	@Qualifier("externalRestOperations") private val externalRestOperations: RestOperations,
 ) : IdentityTokenVerifier {
 	private val decoders = ConcurrentHashMap<LoginProvider, NimbusJwtDecoder>()
@@ -68,7 +66,6 @@ class OidcIdentityTokenVerifier(
 
 	private fun clientId(provider: LoginProvider): String = when (provider) {
 		LoginProvider.GOOGLE -> googleClientId
-		LoginProvider.KAKAO -> kakaoClientId
 	}
 
 	private fun configuration(provider: LoginProvider): ProviderConfiguration = when (provider) {
@@ -76,11 +73,6 @@ class OidcIdentityTokenVerifier(
 			jwkSetUri = "https://www.googleapis.com/oauth2/v3/certs",
 			issuers = setOf("https://accounts.google.com", "accounts.google.com"),
 			audience = googleClientId,
-		)
-		LoginProvider.KAKAO -> ProviderConfiguration(
-			jwkSetUri = "https://kauth.kakao.com/.well-known/jwks.json",
-			issuers = setOf("https://kauth.kakao.com"),
-			audience = kakaoClientId,
 		)
 	}
 

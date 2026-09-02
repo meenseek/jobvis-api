@@ -61,8 +61,6 @@ docker build -t jobvis-api:local .
 | `PORT` | 예 | 플랫폼이 할당한 포트, 기본값 `8080` |
 | `JOBVIS_CORS_ALLOWED_ORIGINS` | 예 | 쉼표로 구분한 정확한 프론트엔드 origin 목록 |
 | `JOBVIS_GOOGLE_CLIENT_ID` | Google 로그인 시 | Google OIDC 클라이언트 ID |
-| `JOBVIS_KAKAO_CLIENT_ID` | Kakao 로그인 시 | Kakao OIDC 앱 키/클라이언트 ID |
-| `JOBVIS_TRUSTED_SITE_SECRET` | private Sites 연결 시 | 32바이트 이상의 Web/API 공유 비밀. Sites 서버가 전달한 플랫폼 사용자만 내부 사용자로 매핑할 때 사용 |
 | `JOBVIS_GMAIL_CLIENT_ID` / `JOBVIS_GMAIL_CLIENT_SECRET` | Gmail 연결 시 | Gmail 읽기 전용 OAuth 클라이언트 |
 | `JOBVIS_MICROSOFT_CLIENT_ID` / `JOBVIS_MICROSOFT_CLIENT_SECRET` | Outlook 연결 시 | Microsoft Graph `Mail.Read` OAuth 클라이언트 |
 | `JOBVIS_GOOGLE_CALENDAR_CLIENT_ID` / `JOBVIS_GOOGLE_CALENDAR_CLIENT_SECRET` | Calendar 내보내기 시 | 별도 Calendar events OAuth 클라이언트 |
@@ -79,14 +77,6 @@ docker build -t jobvis-api:local .
 각 import claim의 heartbeat가 서로를 막지 않도록 `JOBVIS_IMPORT_WORKER_CONCURRENCY`는 1~32이면서 `JOBVIS_DB_MAX_POOL_SIZE` 이하여야 합니다. `JOBVIS_GMAIL_FETCH_CONCURRENCY`는 1~16, `JOBVIS_IMPORT_HEARTBEAT_INTERVAL`은 1~30초, `JOBVIS_IMPORT_WORKER_SHUTDOWN_GRACE`는 0초~5분이어야 합니다. heartbeat는 worker 수만큼 병렬 실행되며 애플리케이션이 시작 시 이 범위를 모두 검증합니다.
 
 전달 헤더는 기본적으로 신뢰하지 않습니다. 인그레스가 클라이언트의 `Forwarded`/`X-Forwarded-*` 값을 제거하고 직접 다시 쓰는 구성이 확인된 경우에만 `JOBVIS_FORWARD_HEADERS_STRATEGY=framework`를 사용합니다. Jobvis Web 인증 BFF는 이 정리된 `Forwarded`/`X-Forwarded-For`를 API까지 전달하며, API의 로그인 rate limit은 복원된 클라이언트 주소를 기준으로 적용됩니다.
-
-private Sites 배포에서는 Sites가 인증한 `oai-authenticated-user-id`를 Web BFF가 서버 전용
-`X-Jobvis-Site-User-Id`로 전달할 수 있습니다. 이 경로는 Web과 API 양쪽에 같은
-`JOBVIS_TRUSTED_SITE_SECRET`이 32바이트 이상으로 설정된 경우에만 활성화됩니다. API는 공유
-비밀을 상수 시간으로 비교한 뒤 사용자 식별자를 Jobvis 전용 고정 네임스페이스의 SHA-256 기반
-UUID로 변환합니다. 따라서 공유 비밀을 교체해도 기존 사용자의 데이터 연결은 유지됩니다. 브라우저가
-직접 보낸 헤더나 비밀이 없거나 다른 요청은 세션 인증으로 우회하지 않고 `401`로 거부합니다.
-공개 Sites나 신뢰할 수 없는 프록시에서는 이 경로를 사용하지 않습니다.
 
 ## 헬스체크와 종료
 

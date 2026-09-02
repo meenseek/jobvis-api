@@ -7,7 +7,7 @@ Jobvis의 로그인, 외부 메일 연결, 채용 메일 자동 반영, 지원 �
 - Kotlin 2.3.21, Java 17, Spring Boot 4.1.0
 - Spring Web MVC, Validation, Data JPA, Actuator
 - PostgreSQL 18.4, Flyway
-- Google/Kakao OIDC 검증, 서버 발급 opaque session
+- Google OIDC 검증, 서버 발급 opaque session
 - Gmail REST, Microsoft Graph, Naver IMAP 읽기 전용 수집
 - AES-256-GCM 외부 자격증명 암호화
 - Testcontainers PostgreSQL 통합 테스트
@@ -36,7 +36,7 @@ GET http://localhost:8080/actuator/health
 
 | 메서드 | 경로 | 기능 |
 | --- | --- | --- |
-| `GET` | `/api/v1/auth/providers` | Google/Kakao 설정 가능 여부 |
+| `GET` | `/api/v1/auth/providers` | Google 로그인 설정 가능 여부 |
 | `POST` | `/api/v1/auth/challenges` | 일회용 로그인 challenge와 nonce 발급 |
 | `POST` | `/api/v1/auth/exchange` | 검증된 ID token과 challenge를 서버 세션으로 교환 |
 | `GET` | `/api/v1/auth/me` | 현재 사용자 |

@@ -2,7 +2,7 @@
 set -eu
 
 usage() {
-  echo "사용법: $0 <API hostname> <Sites HTTPS origin> <TLS 알림 이메일>" >&2
+  echo "사용법: $0 <API hostname> <Web HTTPS origin> <TLS 알림 이메일>" >&2
   exit 2
 }
 
@@ -28,12 +28,12 @@ esac
 
 case "$web_origin" in
   https://*) ;;
-  *) fail "Sites origin은 https://로 시작해야 합니다." ;;
+  *) fail "Web origin은 https://로 시작해야 합니다." ;;
 esac
 web_authority=${web_origin#https://}
 case "$web_authority" in
-  ""|*/*|*\?*|*\#*) fail "Sites origin에는 path, query, fragment를 넣지 마세요." ;;
-  *[!A-Za-z0-9.:-]*) fail "Sites origin의 hostname 또는 port 형식을 확인하세요." ;;
+  ""|*/*|*\?*|*\#*) fail "Web origin에는 path, query, fragment를 넣지 마세요." ;;
+  *[!A-Za-z0-9.:-]*) fail "Web origin의 hostname 또는 port 형식을 확인하세요." ;;
 esac
 
 case "$tls_email" in
@@ -47,7 +47,6 @@ command -v openssl >/dev/null 2>&1 || fail "openssl이 필요합니다."
 umask 077
 postgres_password=$(openssl rand -hex 32)
 encryption_key=$(openssl rand -base64 32)
-trusted_site_secret=$(openssl rand -hex 32)
 temp_file="$env_file.tmp.$$"
 trap 'rm -f "$temp_file"' EXIT HUP INT TERM
 
@@ -59,12 +58,10 @@ JOBVIS_POSTGRES_DB=jobvis
 JOBVIS_POSTGRES_USER=jobvis
 JOBVIS_POSTGRES_PASSWORD=$postgres_password
 JOBVIS_ENCRYPTION_KEY_BASE64=$encryption_key
-JOBVIS_TRUSTED_SITE_SECRET=$trusted_site_secret
 JOBVIS_API_MEMORY_LIMIT=1024m
 JOBVIS_POSTGRES_MEMORY_LIMIT=768m
 JOBVIS_CADDY_MEMORY_LIMIT=192m
 JOBVIS_GOOGLE_CLIENT_ID=
-JOBVIS_KAKAO_CLIENT_ID=
 JOBVIS_GMAIL_CLIENT_ID=
 JOBVIS_GMAIL_CLIENT_SECRET=
 JOBVIS_MICROSOFT_CLIENT_ID=

@@ -2,7 +2,6 @@ package com.meenseek.jobvis.auth
 
 enum class LoginProvider {
 	GOOGLE,
-	KAKAO,
 	;
 
 	companion object {

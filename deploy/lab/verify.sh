@@ -32,8 +32,7 @@ published_ports=$(docker compose --env-file "$env_file" -f "$compose_file" confi
 if [ "$checking_example" = false ]; then
   postgres_password=$(sed -n 's/^JOBVIS_POSTGRES_PASSWORD=//p' "$env_file" | tail -n 1)
   encryption_key=$(sed -n 's/^JOBVIS_ENCRYPTION_KEY_BASE64=//p' "$env_file" | tail -n 1)
-  trusted_site_secret=$(sed -n 's/^JOBVIS_TRUSTED_SITE_SECRET=//p' "$env_file" | tail -n 1)
-
+  google_client_id=$(sed -n 's/^JOBVIS_GOOGLE_CLIENT_ID=//p' "$env_file" | tail -n 1)
   [ "${#postgres_password}" -ge 32 ] || {
     echo "오류: PostgreSQL 비밀번호가 32자보다 짧습니다." >&2
     exit 1
@@ -43,11 +42,11 @@ if [ "$checking_example" = false ]; then
     echo "오류: 암호화 키는 Base64로 인코딩한 정확히 32바이트여야 합니다." >&2
     exit 1
   }
-  [ "${#trusted_site_secret}" -ge 32 ] || {
-    echo "오류: Sites 공유 비밀이 32자보다 짧습니다." >&2
+  [ -n "$google_client_id" ] || {
+    echo "오류: 운영 로그인에 필요한 JOBVIS_GOOGLE_CLIENT_ID가 비어 있습니다." >&2
     exit 1
   }
-  case "$postgres_password:$trusted_site_secret" in
+  case "$postgres_password" in
     *replace-with-*)
       echo "오류: 예시 비밀을 운영 .env에 사용할 수 없습니다." >&2
       exit 1
