@@ -12,6 +12,13 @@ Jobvis의 로그인, 외부 메일 연결, 채용 메일 자동 반영, 지원 �
 - AES-256-GCM 외부 자격증명 암호화
 - Testcontainers PostgreSQL 통합 테스트
 
+## 코드와 문서 위치
+
+- `src/main/kotlin/com/meenseek/jobvis/`: 인증, 외부 연결·수집, 지원·일정, 통계 API와 서비스.
+- `src/main/resources/db/migration/`: 보존하는 Flyway migration 이력.
+- `openapi/jobvis-v1.yaml`: [Jobvis Web](https://github.com/meenseek/jobvis-web)이 소비하는 공개 API 계약.
+- `src/test/`: PostgreSQL 통합·계약 테스트. `deploy/lab/`와 `docs/deployment.md`: 배포 절차.
+
 ## 로컬 실행
 
 ```bash
